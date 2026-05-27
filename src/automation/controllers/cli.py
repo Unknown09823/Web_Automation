@@ -112,14 +112,31 @@ def cmd_accounts(args) -> None:
         if args.status:
             path += f"?status_filter={args.status}"
         _print(_request("GET", path))
+    elif args.action == "status":
+        _print(_request("GET", "/accounts/status"))
+    elif args.action == "completed":
+        _print(_request("GET", f"/accounts/completed?limit={args.limit}"))
+    elif args.action == "failed":
+        _print(_request("GET", f"/accounts/failed?limit={args.limit}"))
+    elif args.action == "rejected":
+        _print(_request("GET", f"/accounts/rejected?limit={args.limit}"))
+    elif args.action == "results":
+        path = f"/accounts/results?limit={args.limit}"
+        if args.name:
+            path += f"&account_id={args.name}"
+        _print(_request("GET", path))
     elif args.action == "reload":
         _print(_request("POST", "/accounts/reload"))
+    elif args.action == "reap":
+        _print(_request("POST", "/accounts/locks/reap"))
     elif args.action == "reset":
         _print(_request("POST", f"/accounts/{args.name}/reset"))
     elif args.action == "pause":
         _print(_request("POST", f"/accounts/{args.name}/pause"))
     elif args.action == "resume":
         _print(_request("POST", f"/accounts/{args.name}/resume"))
+    elif args.action == "release":
+        _print(_request("POST", f"/accounts/{args.name}/release"))
 
 
 def cmd_workers(_a) -> None:
@@ -196,9 +213,16 @@ def build_parser() -> argparse.ArgumentParser:
     pp.set_defaults(func=cmd_plugins)
 
     pa = sub.add_parser("accounts", help="manage accounts")
-    pa.add_argument("action", choices=["list", "reload", "reset", "pause", "resume"])
+    pa.add_argument(
+        "action",
+        choices=[
+            "list", "status", "completed", "failed", "rejected", "results",
+            "reload", "reset", "pause", "resume", "release", "reap",
+        ],
+    )
     pa.add_argument("name", nargs="?", default="")
     pa.add_argument("--status", default=None)
+    pa.add_argument("--limit", type=int, default=50)
     pa.set_defaults(func=cmd_accounts)
 
     pm = sub.add_parser("metrics", help="show metrics")

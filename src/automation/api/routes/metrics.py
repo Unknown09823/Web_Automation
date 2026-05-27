@@ -12,7 +12,7 @@ router = APIRouter(prefix="/metrics", tags=["metrics"])
 async def metrics_json(request: Request, _: str = Depends(auth_required)) -> dict:
     ctx = get_context(request)
     health = ctx.engine.health.snapshot()
-    accounts_stats = ctx.accounts.stats() if ctx.accounts else {}
+    accounts_stats = ctx.accounts.progress() if ctx.accounts else {}
     tm = ctx.engine.task_manager
     tasks_by_status: dict[str, int] = {}
     for t in tm.tasks.values():

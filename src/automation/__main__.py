@@ -49,8 +49,10 @@ async def _run_server(config_path: str, host: str, port: int) -> None:
     if accounts_file:
         accounts = AccountManager(
             source_file=accounts_file,
-            state_file=config.get("accounts_state", "data/state/accounts.json"),
+            state_file=config.get("accounts_state", "data/state/accounts.sqlite"),
             max_attempts=int(config.get("accounts_max_attempts", 3)),
+            lease_seconds=float(config.get("accounts_lease_seconds", 600.0)),
+            require_password=bool(config.get("accounts_require_password", True)),
         )
         accounts.load()
 
@@ -90,6 +92,12 @@ async def _run_server(config_path: str, host: str, port: int) -> None:
             name="config-watch",
         )
 
+    # optional accounts.json hot reload watcher
+    if accounts and bool(config.get("accounts_watch", True)):
+        accounts.start_watcher(
+            interval=float(config.get("accounts_watch_interval", 2.0))
+        )
+
     log.info("starting API on %s:%d", host, port)
     server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="info"))
     try:
@@ -99,6 +107,9 @@ async def _run_server(config_path: str, host: str, port: int) -> None:
             await tg.stop()
         if watcher_task:
             watcher_task.cancel()
+        if accounts:
+            await accounts.stop_watcher()
+            accounts.close()
         if browser:
             await browser.stop()
         await engine.stop()

@@ -84,6 +84,7 @@ python -m automation server --config config/config.json
 | [`docs/termux-control.md`](docs/termux-control.md) | Phone control |
 | [`docs/plugins.md`](docs/plugins.md) | Writing a plugin |
 | [`docs/workflows.md`](docs/workflows.md) | Workflow grammar |
+| [`docs/accounts.md`](docs/accounts.md) | Account format, validation, locking, hot reload |
 | [`docs/ai-brain.md`](docs/ai-brain.md) | AI internals & memory |
 
 ## License

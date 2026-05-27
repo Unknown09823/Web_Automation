@@ -12,7 +12,8 @@ senders are ignored silently and logged.
 
 Supported commands:
   /start /stop /restart /status /reload /health /plugins /logs /workers
-  /accounts /queue /workflows /ai
+  /accounts /completed /failed /rejected /reload_accounts
+  /queue /workflows /ai
 """
 from __future__ import annotations
 
@@ -143,8 +144,29 @@ class TelegramController:
                 "queues": data.get("queues"),
             }, indent=2)
         if cmd in {"accounts"}:
-            data = await self._api("GET", "/accounts")
-            return json.dumps(data.get("stats", {}), indent=2)
+            data = await self._api("GET", "/accounts/status")
+            return _format_accounts_status(data)
+        if cmd in {"completed"}:
+            limit = int(args[0]) if args and args[0].isdigit() else 20
+            data = await self._api("GET", f"/accounts/completed?limit={limit}")
+            return _format_account_list(data, "completed")
+        if cmd in {"failed"}:
+            limit = int(args[0]) if args and args[0].isdigit() else 20
+            data = await self._api("GET", f"/accounts/failed?limit={limit}")
+            return _format_account_list(data, "failed")
+        if cmd in {"rejected"}:
+            data = await self._api("GET", "/accounts/rejected?limit=20")
+            entries = data.get("rejected", []) or []
+            if not entries:
+                return "no rejected accounts"
+            lines = [f"#{e.get('source_index')}: {e.get('reason')}" for e in entries]
+            return "rejected:\n" + "\n".join(lines)
+        if cmd in {"reload_accounts", "accounts_reload"}:
+            data = await self._api("POST", "/accounts/reload")
+            return (
+                f"reloaded: loaded={data.get('loaded', 0)} "
+                f"rejected={data.get('rejected', 0)}"
+            )
         if cmd in {"workflows"}:
             data = await self._api("GET", "/workflows")
             return "\n".join(data.get("workflows", [])) or "no workflows"
@@ -189,8 +211,46 @@ _HELP = (
     "Commands:\n"
     "/start /stop /restart /reload /status /health\n"
     "/plugins /logs [activity|error|debug]\n"
-    "/accounts /workers /queue /workflows /ai"
+    "/accounts /completed [N] /failed [N] /rejected /reload_accounts\n"
+    "/workers /queue /workflows /ai"
 )
+
+
+def _format_accounts_status(data: Any) -> str:
+    """Compact human-readable status block for /accounts."""
+    if not isinstance(data, dict) or not data.get("configured"):
+        return "no account manager configured"
+    p = data.get("progress", {}) or {}
+    lines = [
+        f"total:     {p.get('total', 0)}",
+        f"pending:   {p.get('pending', 0)}",
+        f"running:   {p.get('running', 0)}",
+        f"completed: {p.get('completed', 0)}",
+        f"failed:    {p.get('failed', 0)}",
+        f"skipped:   {p.get('skipped', 0)}",
+        f"rejected:  {p.get('rejected', 0)}",
+        f"speed:     {p.get('speed_per_minute', 0):.2f} acct/min",
+        f"source:    {data.get('source_file', '?')}",
+    ]
+    return "\n".join(lines)
+
+
+def _format_account_list(data: Any, label: str) -> str:
+    if not isinstance(data, dict):
+        return f"no {label} accounts"
+    accounts = data.get("accounts", []) or []
+    if not accounts:
+        return f"no {label} accounts"
+    lines = [f"{label}: {data.get('count', len(accounts))}"]
+    for a in accounts[:30]:
+        ident = a.get("number") or a.get("username") or a.get("email") or a.get("id")
+        suffix = ""
+        if a.get("attempts"):
+            suffix = f" attempts={a['attempts']}"
+        if a.get("last_error"):
+            suffix += f" err={str(a['last_error'])[:60]}"
+        lines.append(f"  - {ident}{suffix}")
+    return "\n".join(lines)
 
 
 def _summary(data: Any, keys: tuple[str, ...] | None = None) -> str:
