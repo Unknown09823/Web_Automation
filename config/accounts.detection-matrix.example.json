@@ -1,0 +1,87 @@
+{
+  "_comment": [
+    "Example 4-cell detection matrix for identity / repeat-registration testing.",
+    "Replace placeholder proxy URLs with proxies you legitimately control or have",
+    "paid for. profile_id values are arbitrary tags; accounts that share a value",
+    "share the same persistent browser profile (cookies, storage, fingerprint).",
+    "",
+    "Run sequentially with:",
+    "  automation-cli workflow batch identity_test_register.yaml \\",
+    "      --accounts probe-a,probe-b,probe-c,probe-d,probe-e \\",
+    "      --inputs '{\"target_url\":\"https://your-domain.duckdns.org/signup\"}'",
+    "",
+    "Expected behavior of a site that detects same-device repeats:",
+    "  probe-a (baseline)                       -> succeed",
+    "  probe-b (same profile + same proxy as A) -> blocked / flagged",
+    "  probe-c (same profile + new proxy)       -> tells you whether device fp is the signal",
+    "  probe-d (new profile + same proxy as A)  -> tells you whether IP/ASN is the signal",
+    "  probe-e (new profile + new proxy)        -> succeed (clean baseline #2)"
+  ],
+  "accounts": [
+    {
+      "number": "5550000001",
+      "password": "REPLACE_ME",
+      "metadata": {
+        "group": "matrix",
+        "profile_id": "device-X",
+        "proxy": "http://user:pass@proxy-Y.example:8080",
+        "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "viewport": {"width": 1366, "height": 768},
+        "locale": "en-US",
+        "timezone_id": "America/New_York"
+      }
+    },
+    {
+      "number": "5550000002",
+      "password": "REPLACE_ME",
+      "metadata": {
+        "group": "matrix",
+        "profile_id": "device-X",
+        "proxy": "http://user:pass@proxy-Y.example:8080",
+        "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "viewport": {"width": 1366, "height": 768},
+        "locale": "en-US",
+        "timezone_id": "America/New_York"
+      }
+    },
+    {
+      "number": "5550000003",
+      "password": "REPLACE_ME",
+      "metadata": {
+        "group": "matrix",
+        "profile_id": "device-X",
+        "proxy": "http://user:pass@proxy-Z.example:8080",
+        "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "viewport": {"width": 1366, "height": 768},
+        "locale": "en-US",
+        "timezone_id": "America/New_York"
+      }
+    },
+    {
+      "number": "5550000004",
+      "password": "REPLACE_ME",
+      "metadata": {
+        "group": "matrix",
+        "profile_id": "device-W",
+        "proxy": "http://user:pass@proxy-Y.example:8080",
+        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+        "viewport": {"width": 1440, "height": 900},
+        "locale": "fr-FR",
+        "timezone_id": "Europe/Paris"
+      }
+    },
+    {
+      "number": "5550000005",
+      "password": "REPLACE_ME",
+      "metadata": {
+        "group": "matrix",
+        "profile_id": "device-W",
+        "proxy": "http://user:pass@proxy-Z.example:8080",
+        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+        "viewport": {"width": 1440, "height": 900},
+        "locale": "fr-FR",
+        "timezone_id": "Europe/Paris"
+      }
+    }
+  ]
+}

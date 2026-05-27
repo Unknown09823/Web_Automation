@@ -85,6 +85,7 @@ python -m automation server --config config/config.json
 | [`docs/plugins.md`](docs/plugins.md) | Writing a plugin |
 | [`docs/workflows.md`](docs/workflows.md) | Workflow grammar |
 | [`docs/accounts.md`](docs/accounts.md) | Account format, validation, locking, hot reload |
+| [`docs/identity-testing.md`](docs/identity-testing.md) | Per-account proxy + fingerprint, repeat-registration matrix |
 | [`docs/ai-brain.md`](docs/ai-brain.md) | AI internals & memory |
 
 ## License

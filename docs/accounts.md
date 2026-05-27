@@ -4,6 +4,11 @@ The framework loads test accounts from a JSON file you control. The AI
 Brain **never generates accounts** — it only reads, validates, locks,
 runs, and records results.
 
+> Looking to test repeat-registration / same-device detection on your
+> own site? See [`identity-testing.md`](identity-testing.md). It
+> describes how to use `account.metadata` to pin a proxy or share a
+> browser profile across accounts.
+
 ## Source format
 
 Both shapes are accepted. The recommended envelope is:

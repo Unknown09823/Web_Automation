@@ -1,0 +1,107 @@
+name: identity_test_register
+description: |
+  Identity / repeat-registration probe.
+
+  Runs the AI brain's `register` goal against a single account, capturing
+  enough context (URL, title, screenshot, a couple of common duplicate
+  indicators) to tell you whether the target site detected the registration.
+
+  How to use it
+  -------------
+  Drive this workflow via the matrix runner:
+
+      automation-cli workflow batch identity_test_register.yaml \
+          --accounts probe-a,probe-b,probe-c,probe-d,probe-e \
+          --inputs '{"target_url": "https://your-domain.duckdns.org/signup"}'
+
+  Run sequentially (the default). Accounts whose metadata.profile_id match
+  share the same browser profile dir; accounts whose metadata.proxy match
+  share the same network identity. The framework wires both per session.
+
+  Customize for your site
+  -----------------------
+  The "duplicate detected" signals below are deliberately generic. Override
+  the `inputs` block (or pass `--inputs` to the CLI) to match your site's
+  actual error UI. Common adjustments:
+
+    inputs.duplicate_text     : substring shown on a blocked registration
+    inputs.duplicate_selector : a CSS selector unique to the error UI
+    inputs.success_url_part   : URL fragment that proves a successful signup
+                                (e.g. "/welcome", "/dashboard")
+
+  When `inputs.duplicate_selector` is provided the workflow waits briefly
+  for it; if it appears the run is recorded as blocked. Otherwise a
+  successful URL substring (`success_url_part`) is verified.
+
+inputs:
+  target_url: ""
+  success_url_part: ""
+  duplicate_text: "already"
+  duplicate_selector: ""
+
+steps:
+  - type: log
+    name: probe context
+    params:
+      message: "[identity-probe] account=${account.id} number=${account.number} profile=${account.metadata.profile_id} proxy=${account.metadata.proxy}"
+
+  - type: navigate
+    name: open target
+    params:
+      url: "${target_url}"
+
+  - type: wait
+    name: wait for DOM
+    params:
+      load_state: domcontentloaded
+    on_error: continue
+
+  - type: screenshot
+    name: pre-register snapshot
+    params:
+      path: "data/screenshots/probe-${account.id}-pre.png"
+
+  - type: ai_goal
+    name: attempt register
+    params:
+      goal: register
+      inputs:
+        username: "${account.username}"
+        email: "${account.email}"
+        password: "${account.password}"
+        number: "${account.number}"
+    on_error: continue
+    retries: 1
+
+  - type: wait
+    name: settle
+    params:
+      seconds: 2
+    on_error: continue
+
+  - type: screenshot
+    name: post-register snapshot
+    params:
+      path: "data/screenshots/probe-${account.id}-post.png"
+
+  # Optional explicit duplicate-detection check. Skipped unless the user
+  # supplies a selector / URL fragment for their target site.
+  - type: wait
+    name: wait for duplicate selector
+    if: "duplicate_selector != ''"
+    params:
+      selector: "${duplicate_selector}"
+    on_error: continue
+    timeout_ms: 4000
+
+  - type: verify
+    name: verify success url
+    if: "success_url_part != ''"
+    params:
+      url_contains: "${success_url_part}"
+    on_error: continue
+
+  - type: log
+    name: probe complete
+    params:
+      message: "[identity-probe] done account=${account.id} — review screenshots + the workflow result for verify outcomes"

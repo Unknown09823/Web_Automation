@@ -273,7 +273,8 @@ class WorkflowEngine:
         if t == "wait":
             _require_page(page)
             if "selector" in p:
-                await page.wait_for_selector(p["selector"], timeout=step.timeout_ms)
+                sel = _interpolate(p["selector"], ctx)
+                await page.wait_for_selector(sel, timeout=step.timeout_ms)
             elif "load_state" in p:
                 await page.wait_for_load_state(p["load_state"], timeout=step.timeout_ms)
             else:
@@ -287,7 +288,7 @@ class WorkflowEngine:
             return {"path": path}
         if t == "verify":
             _require_page(page)
-            return await self._verify(page, p)
+            return await self._verify(page, p, ctx)
         if t == "branch":
             cond = p.get("if", "")
             if _eval_condition(cond, ctx):
@@ -328,22 +329,24 @@ class WorkflowEngine:
             raise ValueError(f"unknown act action: {action}")
         return {"action": action, "selector": selector}
 
-    async def _verify(self, page: Any, p: dict[str, Any]) -> Any:
+    async def _verify(self, page: Any, p: dict[str, Any], ctx: dict[str, Any]) -> Any:
         out: dict[str, Any] = {}
         if "url_contains" in p:
             url = page.url
-            ok = p["url_contains"] in url
-            out["url"] = {"value": url, "ok": ok}
+            needle = _interpolate(p["url_contains"], ctx)
+            ok = needle in url
+            out["url"] = {"value": url, "ok": ok, "needle": needle}
             if not ok:
-                raise AssertionError(f"url does not contain {p['url_contains']}: {url}")
+                raise AssertionError(f"url does not contain {needle!r}: {url}")
         if "title_contains" in p:
             title = await page.title()
-            ok = p["title_contains"] in title
-            out["title"] = {"value": title, "ok": ok}
+            needle = _interpolate(p["title_contains"], ctx)
+            ok = needle in title
+            out["title"] = {"value": title, "ok": ok, "needle": needle}
             if not ok:
                 raise AssertionError(f"title mismatch: {title}")
         if "selector_visible" in p:
-            sel = p["selector_visible"]
+            sel = _interpolate(p["selector_visible"], ctx)
             visible = await page.is_visible(sel)
             out["visible"] = {"selector": sel, "ok": visible}
             if not visible:
