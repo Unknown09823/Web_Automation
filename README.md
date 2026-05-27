@@ -76,17 +76,18 @@ python -m automation server --config config/config.json
 
 ## Documentation
 
-| Guide | What |
-|---|---|
-| [`docs/architecture.md`](docs/architecture.md) | Design overview |
-| [`docs/installation.md`](docs/installation.md) | Local setup |
-| [`docs/ec2-deployment.md`](docs/ec2-deployment.md) | EC2 + Nginx + DuckDNS |
-| [`docs/termux-control.md`](docs/termux-control.md) | Phone control |
-| [`docs/plugins.md`](docs/plugins.md) | Writing a plugin |
-| [`docs/workflows.md`](docs/workflows.md) | Workflow grammar |
-| [`docs/accounts.md`](docs/accounts.md) | Account format, validation, locking, hot reload |
-| [`docs/identity-testing.md`](docs/identity-testing.md) | Per-account proxy + fingerprint, repeat-registration matrix |
-| [`docs/ai-brain.md`](docs/ai-brain.md) | AI internals & memory |
+| Guide | Audience | What |
+|---|---|---|
+| [`docs/operator-guide.md`](docs/operator-guide.md) | **Operators** | **Start here.** End-to-end EC2 setup, daily account operations, monitoring, recovery, troubleshooting |
+| [`docs/architecture.md`](docs/architecture.md) | Engineers | Design overview |
+| [`docs/installation.md`](docs/installation.md) | Engineers | Local dev setup |
+| [`docs/ec2-deployment.md`](docs/ec2-deployment.md) | Engineers | Lower-level EC2 + Nginx + DuckDNS reference |
+| [`docs/termux-control.md`](docs/termux-control.md) | Operators | Phone control |
+| [`docs/plugins.md`](docs/plugins.md) | Engineers | Writing a plugin |
+| [`docs/workflows.md`](docs/workflows.md) | Both | Workflow grammar |
+| [`docs/accounts.md`](docs/accounts.md) | Both | Account format, validation, locking, hot reload |
+| [`docs/identity-testing.md`](docs/identity-testing.md) | Both | Per-account proxy + fingerprint, repeat-registration matrix |
+| [`docs/ai-brain.md`](docs/ai-brain.md) | Engineers | AI internals & memory |
 
 ## License
 
