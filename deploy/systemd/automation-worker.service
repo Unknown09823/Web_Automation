@@ -1,0 +1,24 @@
+[Unit]
+Description=Automation Framework Worker Node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=automation
+Group=automation
+WorkingDirectory=/opt/automation
+Environment="PATH=/opt/automation/venv/bin:/usr/bin:/bin"
+EnvironmentFile=-/etc/automation/automation.env
+ExecStart=/opt/automation/venv/bin/python -m automation worker \
+    --coordinator-url ${AUTOMATION_API_URL}
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+
+NoNewPrivileges=true
+PrivateTmp=true
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

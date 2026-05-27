@@ -1,0 +1,33 @@
+{
+  "name": "example_login",
+  "description": "Generic, AI-driven login. Inputs come from the account manager.",
+  "inputs": {},
+  "steps": [
+    {
+      "type": "navigate",
+      "name": "open target",
+      "params": {"url": "${target_url}"}
+    },
+    {
+      "type": "wait",
+      "params": {"load_state": "domcontentloaded"}
+    },
+    {
+      "type": "ai_goal",
+      "name": "log in via AI",
+      "params": {
+        "goal": "login",
+        "inputs": {
+          "username": "${account.username}",
+          "email": "${account.email}",
+          "password": "${account.password}"
+        }
+      },
+      "retries": 1
+    },
+    {
+      "type": "screenshot",
+      "params": {"path": "data/screenshots/login-${ts}.png"}
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+[
+  {
+    "id": "user001",
+    "username": "tester001",
+    "email": "tester001@example.test",
+    "password": "REPLACE_ME",
+    "metadata": {"group": "alpha"}
+  },
+  {
+    "id": "user002",
+    "username": "tester002",
+    "email": "tester002@example.test",
+    "password": "REPLACE_ME",
+    "metadata": {"group": "alpha"}
+  }
+]

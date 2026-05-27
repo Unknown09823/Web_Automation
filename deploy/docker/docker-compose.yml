@@ -1,0 +1,35 @@
+services:
+  automation:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    image: automation-framework:latest
+    container_name: automation
+    restart: unless-stopped
+    env_file:
+      - ../../.env
+    environment:
+      AUTOMATION_HOST: "0.0.0.0"
+      AUTOMATION_PORT: "8080"
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ../../config:/opt/automation/config:ro
+      - ../../plugins_external:/opt/automation/plugins_external:ro
+      - automation-data:/opt/automation/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Optional: an additional worker node. Uncomment and point at a leader
+  # worker:
+  #   image: automation-framework:latest
+  #   restart: unless-stopped
+  #   env_file: ../../.env
+  #   command: ["python", "-m", "automation", "worker", "--coordinator-url", "http://automation:8080"]
+  #   depends_on: [automation]
+
+volumes:
+  automation-data:

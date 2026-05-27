@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Automation Framework — Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root {
+      --bg: #0d1117;
+      --panel: #161b22;
+      --border: #30363d;
+      --fg: #c9d1d9;
+      --muted: #8b949e;
+      --ok: #3fb950;
+      --warn: #d29922;
+      --err: #f85149;
+      --accent: #58a6ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 14px/1.5 -apple-system, "Segoe UI", system-ui, sans-serif;
+      background: var(--bg); color: var(--fg);
+    }
+    header {
+      padding: 14px 20px; border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; gap: 12px; background: var(--panel);
+    }
+    header h1 { font-size: 16px; margin: 0; flex: 1; }
+    .pill { padding: 4px 10px; border-radius: 999px; font-size: 12px;
+            background: #21262d; border: 1px solid var(--border); }
+    .ok { color: var(--ok); }
+    .warn { color: var(--warn); }
+    .err { color: var(--err); }
+    button {
+      background: #21262d; color: var(--fg); border: 1px solid var(--border);
+      padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 13px;
+    }
+    button:hover { border-color: var(--accent); color: var(--accent); }
+    button.danger:hover { border-color: var(--err); color: var(--err); }
+    main { padding: 20px; display: grid; gap: 16px;
+           grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+    .card {
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 8px; padding: 14px;
+    }
+    .card h2 {
+      margin: 0 0 10px; font-size: 13px; text-transform: uppercase;
+      letter-spacing: 0.05em; color: var(--muted);
+    }
+    .kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; }
+    .kv span:nth-child(odd) { color: var(--muted); }
+    pre {
+      margin: 0; background: #010409; padding: 10px; border-radius: 6px;
+      font-size: 12px; max-height: 320px; overflow: auto;
+      border: 1px solid var(--border);
+    }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-weight: 600; }
+    .gauge { height: 6px; background: #21262d; border-radius: 3px; overflow: hidden; }
+    .gauge > div { height: 100%; background: var(--accent); transition: width 0.4s; }
+    input.token {
+      background: #010409; color: var(--fg); border: 1px solid var(--border);
+      border-radius: 6px; padding: 6px 10px; font-size: 12px; width: 280px;
+    }
+    .footer { padding: 12px 20px; color: var(--muted); font-size: 12px;
+              border-top: 1px solid var(--border); }
+    a { color: var(--accent); text-decoration: none; }
+  </style>
+</head>
+<body>
+<header>
+  <h1>Automation Framework</h1>
+  <span id="status-pill" class="pill">checking...</span>
+  <input id="token" class="token" placeholder="API token (optional)" />
+  <button onclick="ctrl('start')">Start</button>
+  <button onclick="ctrl('stop')" class="danger">Stop</button>
+  <button onclick="ctrl('restart')">Restart</button>
+  <button onclick="ctrl('reload')">Reload</button>
+</header>
+
+<main>
+  <section class="card">
+    <h2>System</h2>
+    <div class="kv" id="system"></div>
+    <div style="margin-top:8px"><div class="gauge"><div id="cpu-bar" style="width:0%"></div></div>
+      <small id="cpu-label">CPU</small></div>
+    <div style="margin-top:6px"><div class="gauge"><div id="mem-bar" style="width:0%"></div></div>
+      <small id="mem-label">Memory</small></div>
+  </section>
+
+  <section class="card">
+    <h2>Engine</h2>
+    <div class="kv" id="engine"></div>
+  </section>
+
+  <section class="card">
+    <h2>Plugins</h2>
+    <table id="plugins"><thead><tr>
+      <th>Name</th><th>Version</th><th>Enabled</th><th>Started</th><th></th>
+    </tr></thead><tbody></tbody></table>
+  </section>
+
+  <section class="card">
+    <h2>Accounts</h2>
+    <div class="kv" id="accounts"></div>
+  </section>
+
+  <section class="card">
+    <h2>Queues</h2>
+    <table id="queues"><thead><tr><th>Name</th><th>Size</th></tr></thead><tbody></tbody></table>
+  </section>
+
+  <section class="card">
+    <h2>AI Brain</h2>
+    <div class="kv" id="ai"></div>
+    <div id="ai-decision" style="margin-top:10px"></div>
+  </section>
+
+  <section class="card" style="grid-column: 1 / -1;">
+    <h2>Recent Workflow Runs</h2>
+    <table id="wf"><thead><tr>
+      <th>Workflow</th><th>Status</th><th>Duration</th><th>Steps</th>
+    </tr></thead><tbody></tbody></table>
+  </section>
+
+  <section class="card" style="grid-column: 1 / -1;">
+    <h2>Activity Log</h2>
+    <pre id="log"></pre>
+  </section>
+</main>
+
+<footer class="footer">
+  <span id="ts"></span> &nbsp;|&nbsp;
+  <a href="/docs" target="_blank">API docs</a> &nbsp;|&nbsp;
+  <a href="/metrics/prometheus" target="_blank">Prometheus metrics</a>
+</footer>
+
+<script>
+const TOKEN_KEY = "automation.api.token";
+const tokenEl = document.getElementById("token");
+tokenEl.value = localStorage.getItem(TOKEN_KEY) || "";
+tokenEl.addEventListener("change", () => localStorage.setItem(TOKEN_KEY, tokenEl.value));
+
+function headers() {
+  const h = { "Accept": "application/json" };
+  if (tokenEl.value) h["Authorization"] = "Bearer " + tokenEl.value;
+  return h;
+}
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, { headers: headers(), ...opts });
+  if (!r.ok) throw new Error(r.status + " " + r.statusText);
+  const ct = r.headers.get("content-type") || "";
+  return ct.includes("application/json") ? r.json() : r.text();
+}
+
+async function ctrl(action) {
+  try {
+    await api("/control/" + action, { method: "POST" });
+    setTimeout(refresh, 600);
+  } catch (e) { alert(action + " failed: " + e.message); }
+}
+
+function kv(el, obj) {
+  el.innerHTML = "";
+  for (const [k, v] of Object.entries(obj)) {
+    const a = document.createElement("span"); a.textContent = k;
+    const b = document.createElement("span");
+    b.textContent = (v === null || v === undefined) ? "—" : String(v);
+    el.append(a, b);
+  }
+}
+
+async function refresh() {
+  const pill = document.getElementById("status-pill");
+  document.getElementById("ts").textContent = "Updated " + new Date().toLocaleTimeString();
+  try {
+    const [status, metrics, ai, wf] = await Promise.all([
+      api("/status"),
+      api("/metrics"),
+      api("/ai/status").catch(() => ({ enabled: false })),
+      api("/workflows/results/recent?limit=10").catch(() => ({ results: [] })),
+    ]);
+
+    pill.textContent = status.running ? "running" : "stopped";
+    pill.className = "pill " + (status.status === "ok" ? "ok" : "warn");
+
+    const sys = metrics.system || {};
+    kv(document.getElementById("system"), {
+      "CPU": sys.cpu_percent + "%",
+      "Memory": sys.memory_percent + "% (" + Math.round(sys.memory_used_mb) + " MB)",
+      "Disk": sys.disk_percent + "%",
+      "Uptime": Math.round(sys.uptime_seconds) + "s",
+      "Status": sys.status,
+    });
+    document.getElementById("cpu-bar").style.width = (sys.cpu_percent || 0) + "%";
+    document.getElementById("mem-bar").style.width = (sys.memory_percent || 0) + "%";
+
+    kv(document.getElementById("engine"), {
+      "Running": status.running,
+      "Workers": status.scheduler ? status.scheduler.max_workers : "?",
+      "Jobs": (status.scheduler ? status.scheduler.jobs : []).join(", ") || "(none)",
+      "Browser sessions": (status.browser_sessions || []).length,
+    });
+
+    const tbody = document.querySelector("#plugins tbody");
+    tbody.innerHTML = "";
+    for (const p of status.plugins || []) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td>${p.name}</td><td>${p.version || ""}</td>
+        <td class="${p.enabled ? "ok" : "warn"}">${p.enabled}</td>
+        <td class="${p.started ? "ok" : "warn"}">${p.started}</td>
+        <td><button onclick="togglePlugin('${p.name}', ${p.enabled})">${p.enabled ? "Disable" : "Enable"}</button></td>`;
+      tbody.appendChild(tr);
+    }
+
+    if (status.accounts) {
+      kv(document.getElementById("accounts"), status.accounts);
+    } else {
+      kv(document.getElementById("accounts"), { "(no accounts loaded)": "" });
+    }
+
+    const qbody = document.querySelector("#queues tbody");
+    qbody.innerHTML = "";
+    for (const [name, size] of Object.entries(status.queues || {})) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td>${name}</td><td>${size}</td>`;
+      qbody.appendChild(tr);
+    }
+
+    kv(document.getElementById("ai"), {
+      "Enabled": ai.enabled,
+      "Memory": ai.memory ? "yes" : "no",
+      "Dry-run": ai.dry_run || false,
+    });
+    const decisionEl = document.getElementById("ai-decision");
+    if (ai.last_decision) {
+      decisionEl.innerHTML = `<small>Last decision: <b>${ai.last_decision.goal}</b> 
+        success=${ai.last_decision.success} 
+        steps=${(ai.last_decision.plan?.steps || []).length}</small>`;
+    } else {
+      decisionEl.innerHTML = "<small>No decisions yet.</small>";
+    }
+
+    const wfBody = document.querySelector("#wf tbody");
+    wfBody.innerHTML = "";
+    for (const r of (wf.results || []).slice().reverse()) {
+      const tr = document.createElement("tr");
+      const status = r.status || "?";
+      const cls = status === "succeeded" ? "ok" : "err";
+      tr.innerHTML = `<td>${r.workflow || ""}</td><td class="${cls}">${status}</td>
+        <td>${r.duration_ms || 0}ms</td><td>${(r.records || []).length}</td>`;
+      wfBody.appendChild(tr);
+    }
+
+    try {
+      const logs = await api("/logs/activity?lines=40");
+      document.getElementById("log").textContent = (logs.lines || []).join("\n");
+    } catch (e) { /* ignore */ }
+  } catch (e) {
+    pill.textContent = "error: " + e.message;
+    pill.className = "pill err";
+  }
+}
+
+async function togglePlugin(name, enabled) {
+  try {
+    await api(`/plugins/${name}/${enabled ? "disable" : "enable"}`, { method: "POST" });
+    refresh();
+  } catch (e) { alert(e.message); }
+}
+
+refresh();
+setInterval(refresh, 4000);
+</script>
+</body>
+</html>

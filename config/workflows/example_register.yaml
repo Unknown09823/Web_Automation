@@ -1,0 +1,27 @@
+name: example_register
+description: Generic AI-driven registration. URL and inputs are provided externally.
+inputs: {}
+steps:
+  - type: navigate
+    name: open target
+    params:
+      url: "${target_url}"
+  - type: wait
+    params:
+      load_state: domcontentloaded
+  - type: analyze
+    name: perceive page
+    params:
+      screenshot: true
+  - type: ai_goal
+    name: register via AI
+    params:
+      goal: register
+      inputs:
+        username: "${account.username}"
+        email: "${account.email}"
+        password: "${account.password}"
+    retries: 1
+  - type: screenshot
+    params:
+      path: "data/screenshots/register-${ts}.png"

@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+venv/
+.DS_Store
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Runtime data
+data/logs/*
+data/state/*
+data/profiles/*
+data/screenshots/*
+data/learning/*
+data/downloads/*
+!data/logs/.gitkeep
+!data/state/.gitkeep
+!data/profiles/.gitkeep
+!data/screenshots/.gitkeep
+!data/learning/.gitkeep
+!data/downloads/.gitkeep

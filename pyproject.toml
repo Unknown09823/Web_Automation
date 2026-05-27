@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "automation-framework"
+version = "1.0.0"
+description = "Production-grade plugin-driven automation framework with central AI Brain"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+authors = [{name = "Automation Framework"}]
+classifiers = [
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: POSIX :: Linux",
+    "Framework :: AsyncIO",
+]
+dependencies = [
+    "fastapi>=0.110,<1",
+    "uvicorn[standard]>=0.27,<1",
+    "pydantic>=2.6,<3",
+    "PyYAML>=6.0,<7",
+    "psutil>=5.9,<6",
+]
+
+[project.optional-dependencies]
+browser = ["playwright>=1.42,<2"]
+load = ["locust>=2.24,<3"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.4"]
+
+[project.scripts]
+automation = "automation.__main__:main"
+automation-cli = "automation.controllers.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+automation = ["dashboard/*.html", "dashboard/static/**/*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

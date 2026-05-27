@@ -1,0 +1,33 @@
+[Unit]
+Description=Automation Framework (FastAPI + Engine)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=automation
+Group=automation
+WorkingDirectory=/opt/automation
+Environment="PATH=/opt/automation/venv/bin:/usr/bin:/bin"
+EnvironmentFile=-/etc/automation/automation.env
+ExecStart=/opt/automation/venv/bin/python -m automation server \
+    --config /opt/automation/config/config.json \
+    --host 127.0.0.1 \
+    --port 8080
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGINT
+StandardOutput=journal
+StandardError=journal
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/automation/data /var/log/automation
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

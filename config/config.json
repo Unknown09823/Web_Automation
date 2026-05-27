@@ -1,0 +1,66 @@
+{
+  "environment": "testing",
+  "targets": [
+    {
+      "name": "main",
+      "url": "https://your-domain.duckdns.org"
+    }
+  ],
+  "accounts_file": "config/accounts.json",
+  "accounts_state": "data/state/accounts.json",
+  "accounts_max_attempts": 3,
+  "workflows_dir": "config/workflows",
+  "playwright": {
+    "enabled": true,
+    "headless": true,
+    "timeout": 30000,
+    "browser": "chromium",
+    "viewport": {"width": 1280, "height": 800},
+    "profiles_root": "data/profiles",
+    "downloads_dir": "data/downloads",
+    "args": []
+  },
+  "scheduler": {
+    "max_workers": 10
+  },
+  "watchdog": {
+    "interval": 15,
+    "max_recoveries": 5
+  },
+  "logging": {
+    "dir": "data/logs",
+    "level": "INFO",
+    "debug": false
+  },
+  "ai": {
+    "enabled": true,
+    "memory_enabled": true,
+    "memory_path": "data/learning/memory.sqlite",
+    "screenshot_dir": "data/screenshots",
+    "dry_run": false,
+    "max_heal_attempts": 3
+  },
+  "plugins": {
+    "paths": ["plugins_external"],
+    "enabled": {
+      "heartbeat": true,
+      "metrics": true,
+      "example_task": false
+    },
+    "config": {
+      "heartbeat": {"interval": 30}
+    }
+  },
+  "dashboard": {
+    "enabled": true
+  },
+  "telegram": {
+    "token": null,
+    "allowed_chat_ids": []
+  },
+  "config_watch": true,
+  "config_watch_interval": 2.0,
+  "state": {
+    "path": "data/state/state.json"
+  }
+}
