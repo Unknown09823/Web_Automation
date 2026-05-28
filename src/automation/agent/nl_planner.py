@@ -53,6 +53,21 @@ class AccountGenConfig:
             "manual_data": self.manual_data,
         }
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "AccountGenConfig":
+        return cls(
+            count=int(data.get("count", 1)),
+            password=str(data.get("password", "")),
+            generate_numbers=bool(data.get("generate_numbers", False)),
+            number_length=int(data.get("number_length", 10)),
+            number_prefix=str(data.get("number_prefix", "")),
+            generate_emails=bool(data.get("generate_emails", False)),
+            email_domain=str(data.get("email_domain", "example.com")),
+            generate_usernames=bool(data.get("generate_usernames", False)),
+            username_prefix=str(data.get("username_prefix", "user_")),
+            manual_data=list(data.get("manual_data", []) or []),
+        )
+
 
 @dataclass(slots=True)
 class ExecutionPlan:
@@ -78,6 +93,26 @@ class ExecutionPlan:
             "estimated_time_seconds": self.estimated_time_seconds,
             "notes": self.notes,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ExecutionPlan":
+        return cls(
+            instruction=str(data.get("instruction", "")),
+            goals=[AgentGoal.from_dict(g) for g in data.get("goals", [])],
+            account_config=AccountGenConfig.from_dict(
+                data.get("account_config", {}) or {},
+            ),
+            target_url=str(data.get("target_url", "")),
+            parallel=bool(data.get("parallel", False)),
+            max_parallel=int(data.get("max_parallel", 4)),
+            estimated_time_seconds=float(data.get("estimated_time_seconds", 0.0)),
+            notes=list(data.get("notes", []) or []),
+        )
+
+
+def _pretty_keyword(keyword: str) -> str:
+    """Format a goal keyword as a human-readable description."""
+    return keyword.replace("_", " ").title()
 
 
 
@@ -113,6 +148,9 @@ _PASSWORD_PATTERNS = [
     re.compile(r"pass(?:word)?[:\s]+([^\s,\"']+)", re.I),
     re.compile(r"pwd[:\s]+([^\s,\"']+)", re.I),
 ]
+
+# Trailing punctuation to strip from regex captures
+_TRAIL_PUNCT = ".,;:!?)"
 
 _NUMBER_LENGTH_PATTERNS = [
     re.compile(r"(\d+)[\s-]*digit\s+(?:mobile|phone|number)", re.I),
@@ -177,14 +215,14 @@ class NLPlanner:
 
         # Extract URL
         url_match = _URL_PATTERN.search(text)
-        target_url = url_match.group(0).rstrip(".,;") if url_match else ""
+        target_url = url_match.group(0).rstrip(_TRAIL_PUNCT) if url_match else ""
 
-        # Extract password
+        # Extract password (strip trailing sentence punctuation)
         password = ""
         for pattern in _PASSWORD_PATTERNS:
             m = pattern.search(text)
             if m:
-                password = m.group(1)
+                password = m.group(1).rstrip(_TRAIL_PUNCT)
                 break
 
         # Extract number length
@@ -256,14 +294,13 @@ class NLPlanner:
         )
 
     def _extract_goals(self, text: str) -> list[AgentGoal]:
-        """Extract ordered goals from text."""
+        """Extract ordered goals from text, preserving text-position order."""
         text_lower = text.lower()
         goals: list[AgentGoal] = []
         seen: set[GoalType] = set()
 
-        # Split by common delimiters to preserve order
+        # Pass 1: split by common delimiters and pick goals per part in order
         parts = re.split(r"[.,;]\s*|\bthen\b|\bafter\b|\band\b", text_lower)
-
         for part in parts:
             part = part.strip()
             if not part:
@@ -273,18 +310,28 @@ class NLPlanner:
                     seen.add(goal_type)
                     goals.append(AgentGoal(
                         type=goal_type,
-                        description=keyword.replace("_", " ").title(),
+                        description=_pretty_keyword(keyword),
                     ))
                     break
 
-        # Also check the full text for goals not found in parts
+        # Pass 2: catch goals missed by part-splitting, ordered by their first
+        # appearance in the original text (NOT by dict insertion order).
+        missed: list[tuple[int, GoalType, str]] = []
         for keyword, goal_type in _GOAL_KEYWORDS.items():
-            if keyword in text_lower and goal_type not in seen:
-                seen.add(goal_type)
-                goals.append(AgentGoal(
-                    type=goal_type,
-                    description=keyword.replace("_", " ").title(),
-                ))
+            if goal_type in seen:
+                continue
+            idx = text_lower.find(keyword)
+            if idx >= 0:
+                missed.append((idx, goal_type, keyword))
+        missed.sort(key=lambda t: t[0])
+        for _, goal_type, keyword in missed:
+            if goal_type in seen:
+                continue
+            seen.add(goal_type)
+            goals.append(AgentGoal(
+                type=goal_type,
+                description=_pretty_keyword(keyword),
+            ))
 
         return goals
 

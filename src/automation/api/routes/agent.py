@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import time
 from pathlib import Path
 from typing import Any
 
@@ -72,6 +71,9 @@ async def start_run(
       - {"instruction": "..."} - parse NL and execute
       - {"goals": [...], "account_ids": [...], "target_url": "..."}
       - {"plan": <plan_dict>} - execute a previously generated plan
+
+    Returns the real ``run_id`` synchronously (no race) and schedules the
+    actual work as a background task.
     """
     ctx = get_context(request)
     agent = _get_agent(ctx)
@@ -85,11 +87,13 @@ async def start_run(
     max_parallel = payload.get("max_parallel")
 
     from automation.agent.data_factory import DataFactory
-    from automation.agent.goals import AgentGoal, GoalType
+    from automation.agent.goals import AgentGoal
     from automation.agent.nl_planner import NLPlanner
 
+    generated_preview: list[dict] = []
+
     # Option 1: Natural language instruction
-    if instruction and not goals_raw:
+    if instruction and not goals_raw and not plan_data:
         planner = NLPlanner()
         plan = await planner.parse(instruction)
         goals = plan.goals
@@ -107,17 +111,25 @@ async def start_run(
                 generate_usernames=ac.generate_usernames,
             )
             if ctx.accounts:
-                _register_generated_accounts(ctx, generated)
+                await _register_generated_accounts(ctx, generated)
             account_ids = [a.id for a in generated]
+            # Return non-secret preview (no password) so caller can audit
+            generated_preview = [
+                {k: v for k, v in a.to_dict().items() if k != "password"}
+                for a in generated
+            ]
 
-        parallel = plan.parallel if not payload.get("parallel") else parallel
-        max_parallel = max_parallel or plan.max_parallel
+        # Honor explicit payload overrides for parallel / max_parallel.
+        if "parallel" not in payload:
+            parallel = plan.parallel
+        if max_parallel is None:
+            max_parallel = plan.max_parallel
 
     elif plan_data:
         goals = [AgentGoal.from_dict(g) for g in plan_data.get("goals", [])]
         target_url = target_url or plan_data.get("target_url", "")
         if not account_ids:
-            account_ids = plan_data.get("accounts", ["default"])
+            account_ids = plan_data.get("accounts") or ["default"]
 
     elif goals_raw:
         goals = [AgentGoal.from_dict(g) for g in goals_raw]
@@ -127,27 +139,33 @@ async def start_run(
     else:
         raise HTTPException(400, "Provide instruction, plan, or goals")
 
-    asyncio.create_task(
-        agent.execute(
-            goals=goals,
-            account_ids=account_ids,
-            target_url=target_url,
-            instruction=instruction,
-            parallel=bool(parallel),
-            max_parallel=int(max_parallel) if max_parallel else None,
-        ),
-        name="agent-run",
-    )
+    if not goals:
+        raise HTTPException(400, "Could not derive any goals from input")
+    if not account_ids:
+        raise HTTPException(400, "No account IDs provided or derived")
 
-    await asyncio.sleep(0.1)
-    active = agent.active_runs
-    run_id = next(iter(active), "pending")
+    # Synchronously create the run so we know the real run_id, then
+    # schedule the actual execution. No race, no 100ms sleep.
+    run = agent.prepare_run(
+        goals=goals,
+        account_ids=list(account_ids),
+        target_url=target_url,
+        instruction=instruction,
+        parallel=bool(parallel),
+        max_parallel=int(max_parallel) if max_parallel else None,
+    )
+    asyncio.create_task(
+        agent.execute_prepared(run), name=f"agent-run-{run.run_id}",
+    )
+    ctx.record_audit(actor, "agent.run", run.run_id)
+
     return {
         "status": "started",
-        "run_id": run_id,
-        "accounts": account_ids,
+        "run_id": run.run_id,
+        "accounts": list(account_ids),
         "goals": len(goals),
         "target_url": target_url,
+        "generated_accounts": generated_preview,
     }
 
 
@@ -314,19 +332,23 @@ def _get_agent(ctx) -> Any:
     return agent
 
 
-def _register_generated_accounts(ctx, generated) -> None:
-    import tempfile
-    accounts_data = [a.to_dict() for a in generated]
-    tmp = Path(tempfile.mktemp(suffix=".json", prefix="agent_accounts_"))
-    tmp.write_text(json.dumps({"accounts": accounts_data}))
-    original_source = ctx.accounts.source_file
-    ctx.accounts.source_file = tmp
-    ctx.accounts.load()
-    ctx.accounts.source_file = original_source
+async def _register_generated_accounts(ctx, generated) -> None:
+    """Register auto-generated accounts via :py:meth:`AccountManager.add_accounts`.
+
+    Goes through the manager's lock-protected ``add_accounts`` API instead of
+    mutating ``source_file`` (which would race with the file-change watcher).
+    Existing runtime state is preserved on conflicts.
+    """
+    raw = [a.to_dict() for a in generated]
     try:
-        tmp.unlink()
-    except OSError:
-        pass
+        result = await ctx.accounts.add_accounts(raw)
+        if result.rejected:
+            log.warning(
+                "auto-generated accounts rejected: count=%d first=%r",
+                len(result.rejected), result.rejected[0][2],
+            )
+    except Exception:  # noqa: BLE001
+        log.exception("failed to register generated accounts")
 
 
 def _format_plan_reply(plan) -> str:

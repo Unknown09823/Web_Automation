@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from automation.agent.checkpoints import Checkpoint, CheckpointManager
@@ -29,7 +29,7 @@ from automation.agent.goals import (
     GoalStatus,
     GoalType,
 )
-from automation.agent.recorder import ActionRecorder, RecordType, ActionRecord
+from automation.agent.recorder import ActionRecorder
 from automation.agent.recovery import RecoveryStack
 from automation.agent.run import RunContext, RunStatus
 from automation.agent.verifier import SuccessVerifier
@@ -102,7 +102,7 @@ class BrowserAgent:
 
 
     # ---------------------------------------------------------------- public API
-    async def execute(
+    def prepare_run(
         self,
         *,
         goals: list[AgentGoal],
@@ -111,12 +111,13 @@ class BrowserAgent:
         instruction: str = "",
         parallel: bool = False,
         max_parallel: int | None = None,
-        resume: bool = False,
     ) -> RunContext:
-        """Execute goals for a set of accounts.
+        """Synchronously create the RunContext, decompose goals, and persist
+        the plan. Returns the RunContext immediately so callers (e.g. the API
+        layer) can return the run_id without racing the background task.
 
-        Creates a RunContext, decomposes goals, then runs each account
-        through the goal sequence with its own isolated browser session.
+        The actual execution must be started by passing the returned run to
+        :py:meth:`execute_prepared` (typically via ``asyncio.create_task``).
         """
         run = RunContext.create(
             runs_root=self.runs_root,
@@ -126,12 +127,11 @@ class BrowserAgent:
         )
         run.metadata["target_url"] = target_url
         run.metadata["parallel"] = parallel
+        if max_parallel is not None:
+            run.metadata["max_parallel"] = max_parallel
         self._active_runs[run.run_id] = run
 
-        # Decompose goals into executable sub-goals
         plan = self.decomposer.build_plan(goals)
-
-        # Inject target_url into navigate goals
         if target_url:
             for g in plan:
                 if g.type == GoalType.NAVIGATE and "url" not in g.params:
@@ -141,34 +141,52 @@ class BrowserAgent:
             "goals": [g.to_dict() for g in plan],
             "accounts": account_ids,
             "target_url": target_url,
+            "parallel": parallel,
+            "max_parallel": max_parallel,
         })
+        # stash plan on context so execute_prepared can read it back
+        run.metadata["_plan_size"] = len(plan)
+        return run
+
+    async def execute_prepared(self, run: RunContext) -> RunContext:
+        """Execute a previously prepared run. Loads the plan from disk."""
+        import json as _json
+        plan_path = run.base_dir / "plan.json"
+        plan_data = _json.loads(plan_path.read_text())
+        plan = [AgentGoal.from_dict(g) for g in plan_data.get("goals", [])]
+        account_ids = plan_data.get("accounts", run.accounts)
+        parallel = bool(plan_data.get("parallel", False))
+        max_parallel = plan_data.get("max_parallel") or self.max_parallel
 
         await self._emit(AgentEvent(
             type=AgentEventType.RUN_STARTED,
             run_id=run.run_id,
-            message=f"Starting run with {len(account_ids)} accounts, {len(plan)} goals",
+            message=f"Starting run with {len(account_ids)} accounts, "
+                    f"{len(plan)} goals",
             data={"accounts": len(account_ids), "goals": len(plan)},
         ))
-
         run.set_status(RunStatus.RUNNING)
 
         try:
-            mp = max_parallel or self.max_parallel
             if parallel and len(account_ids) > 1:
-                await self._run_parallel(run, plan, account_ids, mp)
+                await self._run_parallel(run, plan, account_ids, int(max_parallel))
             else:
                 await self._run_sequential(run, plan, account_ids)
 
             if run.run_id in self._cancelled:
                 run.set_status(RunStatus.CANCELLED)
+                await self._emit(AgentEvent(
+                    type=AgentEventType.RUN_CANCELLED,
+                    run_id=run.run_id,
+                    message="Run cancelled",
+                ))
             else:
                 run.set_status(RunStatus.COMPLETED)
-
-            await self._emit(AgentEvent(
-                type=AgentEventType.RUN_COMPLETED,
-                run_id=run.run_id,
-                message="Run completed",
-            ))
+                await self._emit(AgentEvent(
+                    type=AgentEventType.RUN_COMPLETED,
+                    run_id=run.run_id,
+                    message="Run completed",
+                ))
         except Exception as exc:  # noqa: BLE001
             log.exception("agent run failed: %s", run.run_id)
             run.set_status(RunStatus.FAILED, error=repr(exc))
@@ -183,6 +201,32 @@ class BrowserAgent:
 
         return run
 
+    async def execute(
+        self,
+        *,
+        goals: list[AgentGoal],
+        account_ids: list[str],
+        target_url: str = "",
+        instruction: str = "",
+        parallel: bool = False,
+        max_parallel: int | None = None,
+        resume: bool = False,
+    ) -> RunContext:
+        """Convenience wrapper: prepare + execute in one call.
+
+        Used by callers that don't need the run_id before execution starts.
+        Equivalent to ``execute_prepared(prepare_run(...))``.
+        """
+        run = self.prepare_run(
+            goals=goals,
+            account_ids=account_ids,
+            target_url=target_url,
+            instruction=instruction,
+            parallel=parallel,
+            max_parallel=max_parallel,
+        )
+        return await self.execute_prepared(run)
+
 
     async def cancel(self, run_id: str) -> bool:
         """Cancel a running agent execution."""
@@ -193,19 +237,17 @@ class BrowserAgent:
 
     async def resume_run(self, run_dir: str) -> RunContext:
         """Resume a previously interrupted run from its last checkpoint."""
+        import json as _json
+
         run = RunContext.load(run_dir)
         run.set_status(RunStatus.RESUMING)
-        # Rebuild goals from saved plan
-        from automation.agent.goals import AgentGoal
         plan_path = run.base_dir / "plan.json"
         if not plan_path.exists():
             run.set_status(RunStatus.FAILED, error="no plan.json found")
             return run
-        import json
-        plan_data = json.loads(plan_path.read_text())
+        plan_data = _json.loads(plan_path.read_text())
         goals = [AgentGoal.from_dict(g) for g in plan_data.get("goals", [])]
         account_ids = plan_data.get("accounts", run.accounts)
-        target_url = plan_data.get("target_url", "")
 
         self._active_runs[run.run_id] = run
         await self._emit(AgentEvent(
@@ -217,13 +259,33 @@ class BrowserAgent:
         run.set_status(RunStatus.RUNNING)
         try:
             await self._run_sequential(
-                run, goals, account_ids, resume=True
+                run, goals, account_ids, resume=True,
             )
-            run.set_status(RunStatus.COMPLETED)
+            if run.run_id in self._cancelled:
+                run.set_status(RunStatus.CANCELLED)
+                await self._emit(AgentEvent(
+                    type=AgentEventType.RUN_CANCELLED,
+                    run_id=run.run_id,
+                    message="Resumed run cancelled",
+                ))
+            else:
+                run.set_status(RunStatus.COMPLETED)
+                await self._emit(AgentEvent(
+                    type=AgentEventType.RUN_COMPLETED,
+                    run_id=run.run_id,
+                    message="Resumed run completed",
+                ))
         except Exception as exc:  # noqa: BLE001
+            log.exception("agent resume failed: %s", run.run_id)
             run.set_status(RunStatus.FAILED, error=repr(exc))
+            await self._emit(AgentEvent(
+                type=AgentEventType.RUN_FAILED,
+                run_id=run.run_id,
+                message=f"Resume failed: {exc!r}",
+            ))
         finally:
             self._active_runs.pop(run.run_id, None)
+            self._cancelled.discard(run.run_id)
         return run
 
     @property
@@ -394,44 +456,51 @@ class BrowserAgent:
                 goal.status = GoalStatus.FAILED
                 return False
 
+            attempt_error: str | None = None
             try:
                 success = await self._attempt_goal(
                     run=run, page=page, account_id=account_id,
                     goal=goal, recorder=recorder,
                 )
             except Exception as exc:  # noqa: BLE001
+                attempt_error = repr(exc)
                 log.warning(
-                    "goal %s attempt %d failed: %s", goal_desc, retries + 1, exc
+                    "goal %s attempt %d raised: %s",
+                    goal_desc, retries + 1, exc,
                 )
                 recorder.record_error(repr(exc), goal=goal_desc)
 
-                if retries < goal.max_retries:
-                    # Try recovery
+            # Trigger recovery on either an exception OR a falsy return
+            # (verification failure). Skip on the final attempt.
+            if not success and retries < goal.max_retries:
+                await self._emit(AgentEvent(
+                    type=AgentEventType.RECOVERY_STARTED,
+                    run_id=run.run_id,
+                    account_id=account_id,
+                    goal=goal_desc,
+                    retry_count=retries + 1,
+                    message=attempt_error or "verification failed",
+                ))
+                recovery_result = await self.recovery.recover(
+                    page,
+                    goal=goal.params.get("ai_goal", goal_desc),
+                    last_error=attempt_error or "",
+                )
+                if recovery_result.recovered:
                     await self._emit(AgentEvent(
-                        type=AgentEventType.RECOVERY_STARTED,
+                        type=AgentEventType.RECOVERY_SUCCEEDED,
                         run_id=run.run_id,
                         account_id=account_id,
                         goal=goal_desc,
-                        retry_count=retries + 1,
+                        message=f"Recovered via {recovery_result.final_strategy}",
                     ))
-                    recovery_result = await self.recovery.recover(
-                        page, goal=goal.params.get("ai_goal", goal_desc),
-                    )
-                    if recovery_result.recovered:
-                        await self._emit(AgentEvent(
-                            type=AgentEventType.RECOVERY_SUCCEEDED,
-                            run_id=run.run_id,
-                            account_id=account_id,
-                            goal=goal_desc,
-                            message=f"Recovered via {recovery_result.final_strategy}",
-                        ))
-                    else:
-                        await self._emit(AgentEvent(
-                            type=AgentEventType.RECOVERY_FAILED,
-                            run_id=run.run_id,
-                            account_id=account_id,
-                            goal=goal_desc,
-                        ))
+                else:
+                    await self._emit(AgentEvent(
+                        type=AgentEventType.RECOVERY_FAILED,
+                        run_id=run.run_id,
+                        account_id=account_id,
+                        goal=goal_desc,
+                    ))
 
             retries += 1
 
@@ -563,8 +632,11 @@ class BrowserAgent:
                     "number": account.number,
                 }
 
-        # Capture before-URL for verification
-        before_url = page.url
+        # Capture before-URL for verification (defensive: page may be closed)
+        try:
+            before_url = page.url
+        except Exception:  # noqa: BLE001
+            before_url = ""
 
         # Take pre-action screenshot
         await run.save_screenshot(page, account_id, f"before_{ai_goal}")
