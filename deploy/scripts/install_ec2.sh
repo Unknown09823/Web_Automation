@@ -21,6 +21,7 @@ apt-get update
 apt-get install -y --no-install-recommends \
     "${PYTHON}" "${PYTHON}-venv" "${PYTHON}-dev" \
     build-essential git nginx curl ca-certificates \
+    nodejs npm \
     fonts-liberation libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
     libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
     libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2 \
@@ -43,6 +44,16 @@ sudo -u "${APP_USER}" "${APP_DIR}/venv/bin/pip" install --upgrade pip wheel
 sudo -u "${APP_USER}" "${APP_DIR}/venv/bin/pip" install -r "${APP_DIR}/requirements.txt"
 sudo -u "${APP_USER}" "${APP_DIR}/venv/bin/pip" install -e "${APP_DIR}"
 sudo -u "${APP_USER}" "${APP_DIR}/venv/bin/playwright" install chromium || true
+
+# Build the modern dashboard (React + Vite). The build outputs into
+# src/automation/dashboard/ where the FastAPI app already mounts it.
+if [[ -d "${APP_DIR}/dashboard-ui" ]]; then
+  if command -v npm >/dev/null 2>&1; then
+    sudo -u "${APP_USER}" bash -c "cd ${APP_DIR}/dashboard-ui && npm ci --no-audit --no-fund && npm run build"
+  else
+    echo "warn: npm not available; skipping dashboard build (basic HTML fallback served)" >&2
+  fi
+fi
 
 mkdir -p "${APP_DIR}/data"/{logs,state,profiles,screenshots,learning,downloads}
 chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}/data"
