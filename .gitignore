@@ -10,6 +10,11 @@ venv/
 build/
 dist/
 
+# Frontend build artifacts (rebuilt during deploy via dashboard-ui/)
+dashboard-ui/node_modules
+dashboard-ui/.vite
+src/automation/dashboard/static/
+
 # Runtime data
 data/logs/*
 data/state/*

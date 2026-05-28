@@ -28,6 +28,35 @@ python -m automation server --config config/config.json
 Open `http://127.0.0.1:8080/dashboard`. Paste the token from `.env` into
 the dashboard token field (it will be stored in your browser only).
 
+### Modern dashboard build
+
+The repository ships a production-grade React + TypeScript dashboard
+under `dashboard-ui/`. Build it once and the FastAPI server picks it up
+automatically:
+
+```bash
+cd dashboard-ui
+npm install        # or: npm ci
+npm run build      # outputs to ../src/automation/dashboard/
+cd ..
+```
+
+If you skip this step, the server falls back to the simple HTML dashboard
+that has shipped historically — both speak the same JSON API, so nothing
+else changes.
+
+For development with hot-reload, run the API on `:8080` and Vite on
+`:5173`:
+
+```bash
+# terminal 1
+python -m automation server --config config/config.json
+
+# terminal 2
+cd dashboard-ui && npm run dev
+# open http://127.0.0.1:5173 — Vite proxies API calls to :8080
+```
+
 ## Configuration
 
 Copy and edit:
