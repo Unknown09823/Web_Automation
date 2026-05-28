@@ -11,6 +11,7 @@ from automation.api.routes import (
     ai as ai_routes,
     control as control_routes,
     distributed as distributed_routes,
+    agent as agent_routes,
 )
 
 __all__ = [
@@ -25,4 +26,5 @@ __all__ = [
     "ai_routes",
     "control_routes",
     "distributed_routes",
+    "agent_routes",
 ]

@@ -22,6 +22,7 @@ from automation.api.deps import AppContext
 
 if TYPE_CHECKING:  # pragma: no cover
     from automation.accounts.manager import AccountManager
+    from automation.agent.agent import BrowserAgent
     from automation.ai.brain import AIBrain
     from automation.browser.manager import BrowserManager
     from automation.controllers.workflow_engine import WorkflowEngine
@@ -36,6 +37,7 @@ def create_app(
     browser: "BrowserManager | None" = None,
     brain: "AIBrain | None" = None,
     workflow_engine: "WorkflowEngine | None" = None,
+    agent: "BrowserAgent | None" = None,
     workflows_dir: str = "config/workflows",
     enable_dashboard: bool = True,
 ) -> FastAPI:
@@ -68,6 +70,7 @@ def create_app(
         browser=browser,
         brain=brain,
         workflow_engine=workflow_engine,
+        agent=agent,
         workflows_dir=workflows_dir,
     )
 
@@ -93,6 +96,7 @@ def create_app(
         distributed_routes, logs_routes, metrics_routes, plugins_routes,
         status_routes, tasks_routes, workflows_routes,
     )
+    from automation.api.routes import agent as agent_routes
     app.include_router(status_routes.router)
     app.include_router(control_routes.router)
     app.include_router(plugins_routes.router)
@@ -104,6 +108,7 @@ def create_app(
     app.include_router(metrics_routes.router)
     app.include_router(ai_routes.router)
     app.include_router(distributed_routes.router)
+    app.include_router(agent_routes.router)
 
     # health/liveness
     @app.get("/health")

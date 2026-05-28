@@ -66,12 +66,26 @@ async def _run_server(config_path: str, host: str, port: int) -> None:
 
     workflow_engine = WorkflowEngine(brain=brain)
 
+    # Create autonomous browser agent
+    from automation.agent.agent import BrowserAgent
+    agent: BrowserAgent | None = None
+    if brain:
+        agent = BrowserAgent(
+            brain=brain,
+            browser=browser,
+            accounts_manager=accounts,
+            event_bus=engine.event_bus,
+            runs_root=config.get("agent.runs_root", "data/runs"),
+            max_parallel=int(config.get("agent.max_parallel", 4)),
+        )
+
     app = create_app(
         engine=engine,
         accounts=accounts,
         browser=browser,
         brain=brain,
         workflow_engine=workflow_engine,
+        agent=agent,
         workflows_dir=config.get("workflows_dir", "config/workflows"),
         enable_dashboard=bool(config.get("dashboard.enabled", True)),
     )
