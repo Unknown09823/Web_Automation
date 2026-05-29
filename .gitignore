@@ -22,9 +22,11 @@ data/profiles/*
 data/screenshots/*
 data/learning/*
 data/downloads/*
+data/runs/*
 !data/logs/.gitkeep
 !data/state/.gitkeep
 !data/profiles/.gitkeep
 !data/screenshots/.gitkeep
 !data/learning/.gitkeep
 !data/downloads/.gitkeep
+!data/runs/.gitkeep

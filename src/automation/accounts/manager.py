@@ -288,6 +288,27 @@ class AccountManager:
         )
         return len(result.valid)
 
+    async def add_accounts(self, raw_entries: list[Any]) -> ValidationResult:
+        """Validate and upsert accounts directly into the store.
+
+        Bypasses ``source_file``, which lets the agent register auto-generated
+        accounts without racing the accounts-file watcher. Existing runtime
+        state is preserved on conflicts (an account previously marked
+        ``completed`` stays completed). Returns the full validation result so
+        callers can inspect rejected rows.
+        """
+        async with self._lock:
+            result = validate_accounts(
+                raw_entries, require_password=self.require_password,
+            )
+            for acc in result.valid:
+                self._store.upsert(acc.to_stored(), preserve_runtime=True)
+            log.info(
+                "added %d accounts directly (rejected=%d)",
+                len(result.valid), len(result.rejected),
+            )
+            return result
+
     async def reload(self) -> int:
         """Re-read the source file under the manager lock."""
         async with self._lock:

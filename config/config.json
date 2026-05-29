@@ -44,6 +44,15 @@
     "dry_run": false,
     "max_heal_attempts": 3
   },
+  "agent": {
+    "enabled": true,
+    "runs_root": "data/runs",
+    "max_parallel": 4,
+    "default_timeout_seconds": 120,
+    "adaptive_wait_poll_ms": 200,
+    "dom_settle_ms": 500,
+    "verification_threshold": 0.6
+  },
   "plugins": {
     "paths": ["plugins_external"],
     "enabled": {
