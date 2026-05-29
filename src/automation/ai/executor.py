@@ -64,6 +64,14 @@ class ActionExecutor:
     all FILL actions use the multi-strategy engine with post-fill
     verification and automatic retry. Otherwise falls back to the
     simple ``page.fill()`` path for backwards compatibility.
+
+    When an :class:`~automation.agent.obstruction.ObstructionDetector`
+    is provided, every CLICK action goes through the detector's
+    ``safe_click`` (probe → unblock if needed → click). This catches
+    the cookie-banner / sticky-header cases that otherwise produce
+    silent zero-effect clicks. The detector is optional; without one
+    the executor uses a plain ``page.click()`` and the rest of the
+    framework behaves exactly as before.
     """
 
     def __init__(
@@ -71,11 +79,13 @@ class ActionExecutor:
         screenshot_dir: str | Path = "data/screenshots",
         dry_run: bool = False,
         form_filler: Any = None,
+        obstruction_detector: Any = None,
     ) -> None:
         self.screenshot_dir = Path(screenshot_dir)
         self.screenshot_dir.mkdir(parents=True, exist_ok=True)
         self.dry_run = dry_run
         self.form_filler = form_filler
+        self.obstruction_detector = obstruction_detector
         # Track filled fields for pre-submit validation
         self._filled_fields: list[tuple[str, str]] = []
 
@@ -213,6 +223,35 @@ class ActionExecutor:
                 self._filled_fields.clear()
 
         if step.selector:
+            # When the obstruction detector is configured, use it to
+            # ensure the click target is visible, in viewport, and
+            # not occluded by a banner or modal. The detector returns
+            # ``(clicked, probe, unblock)`` — a ``False`` ``clicked``
+            # means the click never happened (or raised after unblock),
+            # so we surface that as a regular step error.
+            if self.obstruction_detector is not None:
+                clicked, probe, unblock = await self.obstruction_detector.safe_click(
+                    page, step.selector, timeout_ms=step.timeout_ms,
+                )
+                # Stash diagnostics on the step's metadata so the
+                # reasoning panel / replay file shows *why* a click
+                # was retried or failed. Keys are namespaced to avoid
+                # colliding with caller-supplied metadata.
+                if step.metadata is None:
+                    step.metadata = {}
+                step.metadata["obstruction_probe"] = probe.to_dict()
+                if unblock is not None:
+                    step.metadata["obstruction_unblock"] = unblock.to_dict()
+                if not clicked:
+                    raise RuntimeError(
+                        f"safe_click refused: status={probe.status.value}"
+                        + (f" obstruction={probe.obstruction.description}"
+                           if probe.obstruction else "")
+                        + (f" error={probe.error!r}" if probe.error else "")
+                    )
+                return
+            # Fallback: plain Playwright click for callers that didn't
+            # opt into the obstruction detector.
             await page.click(step.selector, timeout=step.timeout_ms)
             return
         if step.intent:

@@ -97,6 +97,7 @@ def create_app(
         status_routes, tasks_routes, workflows_routes,
     )
     from automation.api.routes import agent as agent_routes
+    from automation.api.routes import telemetry as telemetry_routes
     app.include_router(status_routes.router)
     app.include_router(control_routes.router)
     app.include_router(plugins_routes.router)
@@ -109,6 +110,7 @@ def create_app(
     app.include_router(ai_routes.router)
     app.include_router(distributed_routes.router)
     app.include_router(agent_routes.router)
+    app.include_router(telemetry_routes.router)
 
     # health/liveness
     @app.get("/health")

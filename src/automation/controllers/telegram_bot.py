@@ -419,6 +419,38 @@ class TelegramController:
             await self._send(chat_id, _HELP)
             return
 
+        # ------- cleanup menu / actions -----------------------------------
+        # All cleanup callbacks live behind the ``clear`` and ``cleanup``
+        # action prefixes; ``token`` carries colon-joined arguments.
+        if action == "menu_cleanup":
+            await self._answer_callback(cq_id, "")
+            await self._send_cleanup_menu(sess)
+            return
+        if action == "menu_storage":
+            await self._answer_callback(cq_id, "loading…")
+            await self._send_storage_summary(sess)
+            return
+        if action == "menu_settings_retention":
+            await self._answer_callback(cq_id, "")
+            await self._send_retention_settings(sess)
+            return
+
+        if action == "clear":
+            # token is "<op>" or "<op>:<run_id>"
+            op_part, _sep, run_part = token.partition(":")
+            await self._answer_callback(cq_id, f"clearing {op_part}…")
+            await self._handle_clear_callback(
+                sess, op=op_part, run_id=(run_part or None),
+            )
+            return
+
+        if action == "rset":
+            # token is "<setting_key>:<value>"
+            key, _sep, value = token.partition(":")
+            await self._answer_callback(cq_id, "saving…")
+            await self._handle_setting_callback(sess, key=key, value=value)
+            return
+
         await self._answer_callback(cq_id, f"unknown action: {action}", alert=True)
 
     # ---------------------------------------------------------- session util
@@ -710,6 +742,44 @@ class TelegramController:
                 f"workflow {name} batch started for {len(account_ids)} account(s)"
                 f"\nstatus: {data.get('status', 'unknown')}"
             )
+
+        # ------------------------ telemetry cleanup -----------------------
+        # All five operator-facing /clear_* commands share the same shape:
+        #   /clear_<thing> [run_id] [account_id]
+        # When ``run_id`` is omitted the sweep is global. /clear_chat is
+        # the composite (logs + reasoning + screenshots) bound to one
+        # button on the menu.
+        if cmd in {
+            "clear_chat", "clear_logs", "clear_runs",
+            "clear_screenshots", "clear_reasoning",
+        }:
+            run_id = args[0] if args else None
+            account_id = args[1] if len(args) > 1 else None
+            return await self._format_cleanup_command(
+                op=cmd.replace("clear_", ""),
+                run_id=run_id,
+                account_id=account_id,
+            )
+
+        if cmd == "clear_apply":
+            try:
+                resp = await self._api("POST", "/telemetry/apply")
+            except _ApiError as exc:
+                return f"apply failed: {exc}"
+            return _format_cleanup_result(resp, op="apply settings")
+
+        if cmd in {"clear_settings", "retention", "retention_settings"}:
+            await self._send_retention_settings(sess)
+            raise _Reply("")
+
+        if cmd == "cleanup":
+            # Open the cleanup menu (same as the main-menu button).
+            await self._send_cleanup_menu(sess)
+            raise _Reply("")
+
+        if cmd == "storage":
+            await self._send_storage_summary(sess)
+            raise _Reply("")
 
         return f"unknown command: /{cmd}\n\n{_HELP}"
 
@@ -1036,6 +1106,9 @@ class TelegramController:
                 ],
                 [
                     {"text": "📈 Statistics", "callback_data": "menu_stats:_"},
+                    {"text": "🧹 Cleanup", "callback_data": "menu_cleanup:_"},
+                ],
+                [
                     {"text": "⚙ Settings / Help", "callback_data": "menu_settings:_"},
                 ],
             ],
@@ -1099,6 +1172,250 @@ class TelegramController:
             f"Status:            {status_data.get('status', 'unknown')}",
         ]
         await self._send(sess.chat_id, "\n".join(lines))
+
+    # --------------------------------------------------------- cleanup UI
+    async def _send_cleanup_menu(self, sess: ChatSession) -> None:
+        """Render the operator-facing cleanup buttons.
+
+        Each button maps to one of the bot's /clear_* commands. The
+        first row are the "destroy" actions (one tap = one HTTP call);
+        the bottom row leads into retention settings + storage usage,
+        which are *informational* rather than destructive.
+
+        ``clear:<op>`` is the callback shape; ``run_id`` is supplied
+        when the cleanup is scoped (we'll use the session's last
+        ``run_id`` so a tap always means "this run", never "every run
+        ever").
+        """
+        run_id = sess.last_run_id or ""
+        scope_token = f":{run_id}" if run_id else ""
+        scope_label = run_id[:14] if run_id else "all runs"
+        markup = json.dumps({
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "🗑 Clear Chat",
+                        "callback_data": f"clear:chat{scope_token}",
+                    },
+                    {
+                        "text": "🗑 Screenshots",
+                        "callback_data": f"clear:screenshots{scope_token}",
+                    },
+                ],
+                [
+                    {
+                        "text": "🗑 Logs",
+                        "callback_data": f"clear:logs{scope_token}",
+                    },
+                    {
+                        "text": "🗑 Reasoning",
+                        "callback_data": f"clear:reasoning{scope_token}",
+                    },
+                ],
+                [
+                    {
+                        "text": "🗑 Run History",
+                        "callback_data": "clear:runs",
+                    },
+                    {
+                        "text": "🗑 Completed Runs",
+                        "callback_data": "clear:runs_completed",
+                    },
+                ],
+                [
+                    {
+                        "text": "⚙ Retention Settings",
+                        "callback_data": "menu_settings_retention:_",
+                    },
+                    {
+                        "text": "📦 Storage Usage",
+                        "callback_data": "menu_storage:_",
+                    },
+                ],
+                [
+                    {"text": "← Back", "callback_data": "menu:_"},
+                ],
+            ],
+        })
+        await self._send(
+            sess.chat_id,
+            "🧹 *Cleanup*\n\n"
+            f"Scope: *{scope_label}*\n"
+            "Pick an action below. Destructive operations show how many "
+            "files / bytes were removed.\n\n"
+            "Slash equivalents:\n"
+            "  `/clear_chat [run_id]` `/clear_screenshots`\n"
+            "  `/clear_logs` `/clear_reasoning` `/clear_runs`\n"
+            "  `/clear_apply` (apply persisted settings)",
+            reply_markup=markup,
+        )
+
+    async def _send_retention_settings(self, sess: ChatSession) -> None:
+        """Show the persisted retention settings with one row per knob.
+
+        Each row exposes the operator-visible presets (e.g.
+        10/50/100/Unlimited screenshots). Tapping a button hits
+        ``POST /telemetry/settings`` via the ``rset`` callback,
+        which then re-renders this menu so the operator immediately
+        sees the change reflected.
+        """
+        try:
+            resp = await self._api("GET", "/telemetry/settings")
+        except _ApiError as exc:
+            await self._send(sess.chat_id, f"settings load failed: {exc}")
+            return
+        settings = resp.get("settings", {}) or {}
+        presets = resp.get("presets", {}) or {}
+
+        def _row(key: str, label_fmt: str, unit: str = "") -> list[dict[str, str]]:
+            options = presets.get(key) or []
+            current = settings.get(key, 0)
+            buttons: list[dict[str, str]] = []
+            for opt in options:
+                text = (
+                    "Unlimited" if opt == 0 and "screenshot" in key
+                    else "Never" if opt == 0 and "auto_delete" in key
+                    else "Keep all" if opt == 0
+                    else label_fmt.format(opt)
+                ) + (f" {unit}" if unit and opt > 0 else "")
+                marker = "● " if opt == int(current) else ""
+                buttons.append({
+                    "text": (marker + text).strip(),
+                    "callback_data": f"rset:{key}:{opt}",
+                })
+            return buttons
+
+        keyboard = [
+            _row("screenshot_limit", "Last {}"),
+            _row("auto_delete_minutes", "{}", "min"),
+            _row("reasoning_limit", "Last {}"),
+            _row("keep_completed_runs", "Last {}"),
+            [{"text": "← Back to Cleanup", "callback_data": "menu_cleanup:_"}],
+        ]
+        markup = json.dumps({"inline_keyboard": keyboard})
+
+        text = (
+            "⚙ *Retention Settings*\n\n"
+            "Pick limits for each category. ``0`` / Unlimited / Never "
+            "disables auto-trim for that category.\n\n"
+            f"Screenshots/account:    {_fmt_limit(settings.get('screenshot_limit'), 'last')}\n"
+            f"Auto-delete events:     {_fmt_minutes(settings.get('auto_delete_minutes'))}\n"
+            f"Reasoning lines/acct:   {_fmt_limit(settings.get('reasoning_limit'), 'last')}\n"
+            f"Completed runs kept:    {_fmt_limit(settings.get('keep_completed_runs'), 'last')}\n"
+        )
+        await self._send(sess.chat_id, text, reply_markup=markup)
+
+    async def _send_storage_summary(self, sess: ChatSession) -> None:
+        """Show aggregate disk usage so operators can decide what to trim."""
+        try:
+            data = await self._api("GET", "/telemetry/usage")
+        except _ApiError as exc:
+            await self._send(sess.chat_id, f"usage failed: {exc}")
+            return
+        settings = data.get("settings", {}) or {}
+        text = (
+            "📦 *Storage Usage*\n\n"
+            f"Runs on disk:       {data.get('runs', 0)}\n"
+            f"Screenshots:        {data.get('screenshots', 0)}\n"
+            f"Reasoning lines:    {data.get('reasoning_lines', 0)}\n"
+            f"Total size:         {data.get('total_mb', 0)} MB\n\n"
+            "Current limits:\n"
+            f"  Screenshots/acct: {_fmt_limit(settings.get('screenshot_limit'), 'last')}\n"
+            f"  Reasoning/acct:   {_fmt_limit(settings.get('reasoning_limit'), 'last')}\n"
+            f"  Auto-delete:      {_fmt_minutes(settings.get('auto_delete_minutes'))}\n"
+            f"  Completed runs:   {_fmt_limit(settings.get('keep_completed_runs'), 'last')}\n"
+        )
+        markup = json.dumps({
+            "inline_keyboard": [[
+                {"text": "🧹 Open cleanup", "callback_data": "menu_cleanup:_"},
+                {"text": "⚙ Settings", "callback_data": "menu_settings_retention:_"},
+            ]],
+        })
+        await self._send(sess.chat_id, text, reply_markup=markup)
+
+    async def _handle_clear_callback(
+        self, sess: ChatSession, *, op: str, run_id: str | None,
+    ) -> None:
+        """Dispatch a ``clear:<op>[:run_id]`` button press."""
+        try:
+            text = await self._format_cleanup_command(
+                op=op, run_id=run_id, account_id=None,
+            )
+        except _ApiError as exc:
+            await self._send(sess.chat_id, f"clear {op} failed: {exc}")
+            return
+        await self._send(sess.chat_id, text)
+        # Re-render the cleanup menu so the operator can chain actions
+        # without typing /cleanup again.
+        await self._send_cleanup_menu(sess)
+
+    async def _handle_setting_callback(
+        self, sess: ChatSession, *, key: str, value: str,
+    ) -> None:
+        """Dispatch a ``rset:<key>:<value>`` button press."""
+        if not key:
+            await self._send(sess.chat_id, "missing setting key")
+            return
+        try:
+            int_value = int(value)
+        except (TypeError, ValueError):
+            await self._send(sess.chat_id, f"invalid value for {key}: {value!r}")
+            return
+        try:
+            await self._api(
+                "POST", "/telemetry/settings", body={key: int_value},
+            )
+        except _ApiError as exc:
+            await self._send(sess.chat_id, f"setting update failed: {exc}")
+            return
+        # Re-render the settings panel so the operator sees the new
+        # selected option highlighted.
+        await self._send_retention_settings(sess)
+
+    async def _format_cleanup_command(
+        self,
+        *,
+        op: str,
+        run_id: str | None,
+        account_id: str | None,
+    ) -> str:
+        """Run a single cleanup operation and return a formatted summary.
+
+        Maps the short op-name from the callback (or slash command)
+        onto the matching ``/telemetry/clear/*`` endpoint and
+        formats the structured response for chat display.
+        """
+        body: dict[str, Any] = {}
+        if run_id:
+            body["run_id"] = run_id
+        if account_id:
+            body["account_id"] = account_id
+
+        endpoint_map = {
+            "chat": "/telemetry/clear/chat",
+            "screenshots": "/telemetry/clear/screenshots",
+            "logs": "/telemetry/clear/logs",
+            "reasoning": "/telemetry/clear/reasoning",
+            "runs": "/telemetry/clear/runs",
+        }
+        # Special case: "runs_completed" sweeps every completed run.
+        if op == "runs_completed":
+            body.pop("run_id", None)
+            body["only_completed"] = True
+            body["keep_last"] = 0
+            endpoint = "/telemetry/clear/runs"
+            label = "completed runs"
+        elif op in endpoint_map:
+            endpoint = endpoint_map[op]
+            label = op
+        else:
+            return f"unknown clear op: {op}"
+
+        try:
+            resp = await self._api("POST", endpoint, body=body)
+        except _ApiError as exc:
+            return f"clear {label} failed: {exc}"
+        return _format_cleanup_result(resp, op=label)
 
     async def _send_photo(
         self, chat_id: int, photo_path: str, caption: str = "",
@@ -1536,6 +1853,17 @@ _HELP = (
     "  /wfbatch <name> <ids>  workflow batch run\n"
     "  /abort                 discard a pending plan\n"
     "\n"
+    "CLEANUP\n"
+    "  /cleanup               🧹 open the cleanup menu\n"
+    "  /storage               📦 disk usage summary\n"
+    "  /clear_chat [r] [a]    🗑 logs + reasoning + screenshots\n"
+    "  /clear_screenshots [r] [a]  🗑 trim screenshot files\n"
+    "  /clear_logs [r] [a]    🗑 delete log files\n"
+    "  /clear_reasoning [r] [a]    🗑 trim reasoning.jsonl\n"
+    "  /clear_runs [r]        🗑 remove run directories\n"
+    "  /clear_apply           apply persisted retention settings\n"
+    "  /retention             ⚙ retention settings menu\n"
+    "\n"
     "ENGINE LIFECYCLE\n"
     "  /engine_start          start the framework engine\n"
     "  /stop                  stop the framework engine\n"
@@ -1781,3 +2109,84 @@ def _short(text: str, n: int = 220) -> str:
         return ""
     text = str(text).replace("\n", " ").strip()
     return text if len(text) <= n else text[: n - 1] + "…"
+
+
+
+# ---------------------------------------------------- cleanup formatters
+
+def _format_cleanup_result(resp: dict[str, Any], *, op: str) -> str:
+    """Render a CleanupResult-shaped dict into a one-block chat message.
+
+    Keeps the layout consistent across every /clear_* command so
+    operators always see the same fields in the same order — files
+    removed, bytes removed, scope (runs/accounts touched), and any
+    notes. ``op`` is a free-form label ("screenshots", "logs", …)
+    that goes into the header so the operator immediately sees what
+    just happened.
+    """
+    files = int(resp.get("files_removed") or 0)
+    bytes_ = int(resp.get("bytes_removed") or 0)
+    runs = int(resp.get("runs_touched") or 0)
+    accounts = int(resp.get("accounts_touched") or 0)
+    duration_ms = int(resp.get("duration_ms") or 0)
+    ok = bool(resp.get("ok", True))
+    notes = resp.get("notes") or []
+
+    if not files and not bytes_ and not runs and not accounts:
+        # Nothing to do — say so explicitly rather than printing zeroes.
+        body = "nothing to remove"
+    else:
+        body = (
+            f"  files:    {files}\n"
+            f"  bytes:    {_fmt_bytes(bytes_)}\n"
+            f"  runs:     {runs}\n"
+            f"  accounts: {accounts}\n"
+            f"  duration: {duration_ms} ms"
+        )
+    header = "🗑 cleared {label}".format(label=op) if ok else f"⚠ partial clear ({op})"
+    lines = [header, body]
+    if notes:
+        lines.append("notes:")
+        for n in notes[:5]:
+            lines.append(f"  - {str(n)[:200]}")
+        if len(notes) > 5:
+            lines.append(f"  …(+{len(notes) - 5} more)")
+    return "\n".join(lines)
+
+
+def _fmt_bytes(num: int) -> str:
+    """Compact byte count: 0/512 B/3.4 KB/12.7 MB."""
+    n = float(num)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            if unit == "B":
+                return f"{int(n)} {unit}"
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+def _fmt_limit(value: Any, prefix: str) -> str:
+    """Pretty-print a retention limit."""
+    try:
+        n = int(value or 0)
+    except (TypeError, ValueError):
+        n = 0
+    if n <= 0:
+        return "Unlimited"
+    return f"{prefix} {n}"
+
+
+def _fmt_minutes(value: Any) -> str:
+    """Pretty-print the auto-delete-minutes setting."""
+    try:
+        n = int(value or 0)
+    except (TypeError, ValueError):
+        n = 0
+    if n <= 0:
+        return "Never"
+    if n < 60:
+        return f"{n} min"
+    if n % 60 == 0:
+        return f"{n // 60} hr"
+    return f"{n // 60} hr {n % 60} min"

@@ -176,6 +176,30 @@ class BrowserAgent:
         from automation.agent.form_filler import FormFiller
         self.form_filler = FormFiller()
 
+        # Obstruction detector — applied to every CLICK that goes
+        # through the executor when present. We share the agent's
+        # PopupGuard so the detector's "ask the popup engine to
+        # dismiss the blocker" path uses the same rule catalog the
+        # observer ran in the loop's pre-think phase. This makes the
+        # error-recovery story symmetric: whatever the popup_guard
+        # would have dismissed up front, it can still dismiss
+        # mid-step when an overlay sneaks in.
+        from automation.agent.obstruction import ObstructionDetector
+        self.obstruction_detector = ObstructionDetector(
+            popup_guard=self.popup_guard,
+        )
+
+        # Form engine — orchestrator over Heuristics + FormFiller. Not
+        # currently invoked by the loop directly; exposed on the agent
+        # so plugins / workflows that want a one-shot
+        # "discover-and-fill-everything" call have a high-level API
+        # without re-deriving classification rules per caller.
+        from automation.agent.form_engine import FormEngine
+        self.form_engine = FormEngine(
+            heuristics=self.heuristics,
+            form_filler=self.form_filler,
+        )
+
         # Captcha handler — available for the loop's recovery path.
         from automation.agent.captcha_handler import CaptchaHandler
         self.captcha_handler = CaptchaHandler()
@@ -565,6 +589,7 @@ class BrowserAgent:
             executor = ActionExecutor(
                 screenshot_dir=account_dir / "screenshots",
                 form_filler=self.form_filler,
+                obstruction_detector=self.obstruction_detector,
             )
             step_loop = StepLoop(
                 popup_guard=self.popup_guard,

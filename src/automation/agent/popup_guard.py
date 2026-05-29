@@ -67,6 +67,12 @@ class PopupKind(str, Enum):
     NEWSLETTER = "newsletter"
     AGE_GATE = "age_gate"
     APP_INSTALL = "app_install"
+    # CSS-styled "Enable notifications" / "Allow push" prompts that
+    # *mimic* the browser's native permission UI. We can't dismiss the
+    # real native chrome dialog (Playwright auto-denies it via the
+    # context's permissions list), but in-page imitations need closing
+    # like any other overlay.
+    NOTIFICATION_REQUEST = "notification_request"
     UNKNOWN = "unknown"
 
 
@@ -209,6 +215,37 @@ DEFAULT_RULES: tuple[DismissRule, ...] = (
         ),
         keyboard_fallback=True,
         description="Newsletter subscribe prompt",
+    ),
+    DismissRule(
+        kind=PopupKind.NOTIFICATION_REQUEST,
+        # Targets the *in-page* prompt only. The native browser dialog
+        # is handled at the BrowserContext level (permissions: deny).
+        container_selectors=(
+            '[class*="push" i][class*="notification" i]',
+            '[class*="notification-prompt" i]',
+            '[class*="notification-request" i]',
+            '[class*="permission" i][class*="prompt" i]',
+            '[class*="enable-notifications" i]',
+            '[id*="notification-prompt" i]',
+            'div:has-text("Allow notifications")',
+            'div:has-text("Enable notifications")',
+            'div:has-text("Get notified")',
+            'div:has-text("Stay updated")',
+        ),
+        close_selectors=(
+            'button:has-text("No thanks")',
+            'button:has-text("Not now")',
+            'button:has-text("Maybe later")',
+            'button:has-text("Don\'t allow")',
+            'button:has-text("Block")',
+            'button:has-text("Skip")',
+            'button[aria-label="Close" i]',
+            'button[class*="close" i]',
+            'button[class*="deny" i]',
+            'button[class*="dismiss" i]',
+        ),
+        keyboard_fallback=True,
+        description="In-page notification / push permission prompt",
     ),
     DismissRule(
         kind=PopupKind.AGE_GATE,

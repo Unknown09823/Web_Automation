@@ -170,9 +170,12 @@ def test_popup_guard_clean_page_is_noop() -> None:
     result = asyncio.run(PopupGuard().scan_and_dismiss(page))
     assert not result.any_dismissed
     assert page.clicks == []
-    # All 7 default rules should at least have been *checked* without
-    # producing any "found" entries.
-    assert len(DEFAULT_RULES) == 7
+    # All default rules should at least have been *checked* without
+    # producing any "found" entries. The catalog grows over time as
+    # we recognize new overlay kinds (notification prompts, etc.) —
+    # we assert ``>= 7`` to accept growth without re-touching this
+    # test on every catalog change.
+    assert len(DEFAULT_RULES) >= 7
 
 
 # --------------------------------------------------------------- heuristics
