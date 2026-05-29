@@ -1,16 +1,14 @@
-[
-  {
-    "id": "user001",
-    "username": "tester001",
-    "email": "tester001@example.test",
-    "password": "REPLACE_ME",
-    "metadata": {"group": "alpha"}
-  },
-  {
-    "id": "user002",
-    "username": "tester002",
-    "email": "tester002@example.test",
-    "password": "REPLACE_ME",
-    "metadata": {"group": "alpha"}
-  }
-]
+{
+  "accounts": [
+    {
+      "number": "9999999999",
+      "password": "REPLACE_ME",
+      "metadata": {"group": "alpha"}
+    },
+    {
+      "number": "8888888888",
+      "password": "REPLACE_ME",
+      "metadata": {"group": "alpha"}
+    }
+  ]
+}

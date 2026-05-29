@@ -1,0 +1,185 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 222 36% 5%;
+    --foreground: 210 20% 96%;
+
+    --card: 222 30% 8%;
+    --card-foreground: 210 20% 96%;
+    --popover: 222 32% 7%;
+    --popover-foreground: 210 20% 96%;
+
+    --primary: 213 100% 68%;
+    --primary-foreground: 222 47% 6%;
+
+    --secondary: 222 18% 14%;
+    --secondary-foreground: 210 20% 96%;
+
+    --muted: 222 18% 12%;
+    --muted-foreground: 215 14% 60%;
+
+    --accent: 262 86% 70%;
+    --accent-foreground: 222 47% 6%;
+
+    --destructive: 0 72% 60%;
+    --destructive-foreground: 210 20% 98%;
+
+    --success: 142 70% 50%;
+    --success-foreground: 222 47% 6%;
+
+    --warning: 38 95% 60%;
+    --warning-foreground: 222 47% 6%;
+
+    --border: 222 18% 16%;
+    --input: 222 18% 14%;
+    --ring: 213 100% 68%;
+    --radius: 0.75rem;
+
+    color-scheme: dark;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased font-sans;
+    font-feature-settings: "cv11", "ss01", "ss03";
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+
+  /* Subtle ambient background */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background:
+      radial-gradient(80% 60% at 50% -20%, hsl(213 100% 68% / 0.10), transparent 60%),
+      radial-gradient(60% 60% at 100% 100%, hsl(262 86% 70% / 0.08), transparent 60%),
+      radial-gradient(60% 60% at 0% 100%, hsl(195 100% 60% / 0.06), transparent 60%);
+    z-index: -1;
+  }
+
+  ::selection {
+    background: hsl(var(--primary) / 0.35);
+  }
+
+  /* Scrollbars */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: hsl(var(--border));
+    border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--muted-foreground) / 0.5);
+    background-clip: content-box;
+    border: 2px solid transparent;
+  }
+}
+
+@layer components {
+  /* Glass surfaces — the core motif of the dashboard */
+  .glass {
+    @apply relative bg-card/60 backdrop-blur-xl border border-border/60;
+    background-image:
+      linear-gradient(180deg, hsl(var(--card) / 0.7), hsl(var(--card) / 0.45));
+  }
+
+  .glass-strong {
+    @apply relative bg-card/80 backdrop-blur-2xl border border-border/70;
+  }
+
+  .glass-hover {
+    @apply transition-colors hover:border-border;
+  }
+
+  .panel {
+    @apply glass rounded-xl shadow-soft;
+  }
+
+  /* "Halo" — gradient border ring used on hero stats */
+  .halo {
+    position: relative;
+  }
+  .halo::before {
+    content: "";
+    position: absolute;
+    inset: -1px;
+    border-radius: inherit;
+    padding: 1px;
+    background: linear-gradient(
+      135deg,
+      hsl(var(--primary) / 0.6),
+      hsl(var(--accent) / 0.35) 50%,
+      transparent 80%
+    );
+    -webkit-mask:
+      linear-gradient(#000 0 0) content-box,
+      linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    pointer-events: none;
+  }
+
+  .grid-bg {
+    background-image: var(--tw-gradient-grid, theme("backgroundImage.grid"));
+    background-size: 32px 32px;
+  }
+
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  /* Skeleton shimmer */
+  .shimmer {
+    @apply relative overflow-hidden bg-muted/40;
+  }
+  .shimmer::after {
+    content: "";
+    @apply absolute inset-0 -translate-x-full animate-shimmer;
+    background: linear-gradient(
+      90deg,
+      transparent,
+      hsl(var(--muted-foreground) / 0.08),
+      transparent
+    );
+  }
+
+  /* Status dot */
+  .dot {
+    @apply inline-block w-1.5 h-1.5 rounded-full;
+    box-shadow: 0 0 0 0 currentColor;
+  }
+  .dot.live {
+    animation: pulse-ring 1.6s ease-out infinite;
+  }
+}
+
+@layer utilities {
+  .text-gradient {
+    background: linear-gradient(
+      135deg,
+      hsl(var(--foreground)),
+      hsl(var(--muted-foreground))
+    );
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+}

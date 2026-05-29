@@ -112,14 +112,31 @@ def cmd_accounts(args) -> None:
         if args.status:
             path += f"?status_filter={args.status}"
         _print(_request("GET", path))
+    elif args.action == "status":
+        _print(_request("GET", "/accounts/status"))
+    elif args.action == "completed":
+        _print(_request("GET", f"/accounts/completed?limit={args.limit}"))
+    elif args.action == "failed":
+        _print(_request("GET", f"/accounts/failed?limit={args.limit}"))
+    elif args.action == "rejected":
+        _print(_request("GET", f"/accounts/rejected?limit={args.limit}"))
+    elif args.action == "results":
+        path = f"/accounts/results?limit={args.limit}"
+        if args.name:
+            path += f"&account_id={args.name}"
+        _print(_request("GET", path))
     elif args.action == "reload":
         _print(_request("POST", "/accounts/reload"))
+    elif args.action == "reap":
+        _print(_request("POST", "/accounts/locks/reap"))
     elif args.action == "reset":
         _print(_request("POST", f"/accounts/{args.name}/reset"))
     elif args.action == "pause":
         _print(_request("POST", f"/accounts/{args.name}/pause"))
     elif args.action == "resume":
         _print(_request("POST", f"/accounts/{args.name}/resume"))
+    elif args.action == "release":
+        _print(_request("POST", f"/accounts/{args.name}/release"))
 
 
 def cmd_workers(_a) -> None:
@@ -153,6 +170,19 @@ def cmd_workflow(args) -> None:
     elif args.action == "run":
         body = {"account_id": args.account, "inputs": json.loads(args.inputs or "{}")}
         _print(_request("POST", f"/workflows/{args.name}/run", body))
+    elif args.action == "batch":
+        ids = [s.strip() for s in (args.accounts or "").split(",") if s.strip()]
+        if not ids:
+            print("error: --accounts is required (comma-separated ids)", file=sys.stderr)
+            sys.exit(2)
+        body = {
+            "account_ids": ids,
+            "inputs": json.loads(args.inputs or "{}"),
+            "parallel": bool(args.parallel),
+            "max_parallel": int(args.max_parallel),
+            "stop_on_failure": bool(args.stop_on_failure),
+        }
+        _print(_request("POST", f"/workflows/{args.name}/run_for_accounts", body))
     elif args.action == "results":
         _print(_request("GET", "/workflows/results/recent"))
 
@@ -196,9 +226,16 @@ def build_parser() -> argparse.ArgumentParser:
     pp.set_defaults(func=cmd_plugins)
 
     pa = sub.add_parser("accounts", help="manage accounts")
-    pa.add_argument("action", choices=["list", "reload", "reset", "pause", "resume"])
+    pa.add_argument(
+        "action",
+        choices=[
+            "list", "status", "completed", "failed", "rejected", "results",
+            "reload", "reset", "pause", "resume", "release", "reap",
+        ],
+    )
     pa.add_argument("name", nargs="?", default="")
     pa.add_argument("--status", default=None)
+    pa.add_argument("--limit", type=int, default=50)
     pa.set_defaults(func=cmd_accounts)
 
     pm = sub.add_parser("metrics", help="show metrics")
@@ -206,10 +243,18 @@ def build_parser() -> argparse.ArgumentParser:
     pm.set_defaults(func=cmd_metrics)
 
     pw = sub.add_parser("workflow", help="manage workflows")
-    pw.add_argument("action", choices=["list", "run", "results"])
+    pw.add_argument("action", choices=["list", "run", "batch", "results"])
     pw.add_argument("name", nargs="?", default="")
-    pw.add_argument("--account", default=None)
+    pw.add_argument("--account", default=None, help="account id (run only)")
+    pw.add_argument("--accounts", default=None,
+                    help="comma-separated account ids (batch only)")
     pw.add_argument("--inputs", default=None, help="JSON inputs")
+    pw.add_argument("--parallel", action="store_true",
+                    help="batch: run accounts concurrently (default: sequential)")
+    pw.add_argument("--max-parallel", type=int, default=4,
+                    help="batch: bound on concurrency when --parallel")
+    pw.add_argument("--stop-on-failure", action="store_true",
+                    help="batch sequential: halt after first failed account")
     pw.set_defaults(func=cmd_workflow)
 
     pai = sub.add_parser("ai", help="ai brain inspection")

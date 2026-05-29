@@ -10,6 +10,11 @@ venv/
 build/
 dist/
 
+# Frontend build artifacts (rebuilt during deploy via dashboard-ui/)
+dashboard-ui/node_modules
+dashboard-ui/.vite
+src/automation/dashboard/static/
+
 # Runtime data
 data/logs/*
 data/state/*
@@ -17,9 +22,15 @@ data/profiles/*
 data/screenshots/*
 data/learning/*
 data/downloads/*
+data/runs/*
+data/templates/*
+data/execution_templates/*
 !data/logs/.gitkeep
 !data/state/.gitkeep
 !data/profiles/.gitkeep
 !data/screenshots/.gitkeep
 !data/learning/.gitkeep
 !data/downloads/.gitkeep
+!data/runs/.gitkeep
+!data/templates/.gitkeep
+!data/execution_templates/.gitkeep

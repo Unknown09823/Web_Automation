@@ -13,6 +13,7 @@ from automation.utils.security import constant_time_eq
 
 if TYPE_CHECKING:  # pragma: no cover
     from automation.accounts.manager import AccountManager
+    from automation.agent.agent import BrowserAgent
     from automation.ai.brain import AIBrain
     from automation.browser.manager import BrowserManager
     from automation.controllers.workflow_engine import WorkflowEngine
@@ -33,6 +34,7 @@ class AppContext:
     browser: "BrowserManager | None" = None
     brain: "AIBrain | None" = None
     workflow_engine: "WorkflowEngine | None" = None
+    agent: "BrowserAgent | None" = None
     audit: list[dict[str, Any]] = field(default_factory=list)
     workflows_dir: str = "config/workflows"
     workflow_results: list[dict[str, Any]] = field(default_factory=list)

@@ -61,6 +61,17 @@
     th { color: var(--muted); font-weight: 600; }
     .gauge { height: 6px; background: #21262d; border-radius: 3px; overflow: hidden; }
     .gauge > div { height: 100%; background: var(--accent); transition: width 0.4s; }
+    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+    .stat {
+      background: #010409; border: 1px solid var(--border);
+      border-radius: 6px; padding: 8px; text-align: center;
+    }
+    .stat .num { font-size: 22px; font-weight: 600; }
+    .stat .lbl { font-size: 11px; color: var(--muted); text-transform: uppercase;
+                 letter-spacing: 0.05em; }
+    .stat.ok .num { color: var(--ok); }
+    .stat.warn .num { color: var(--warn); }
+    .stat.err .num { color: var(--err); }
     input.token {
       background: #010409; color: var(--fg); border: 1px solid var(--border);
       border-radius: 6px; padding: 6px 10px; font-size: 12px; width: 280px;
@@ -105,7 +116,8 @@
 
   <section class="card">
     <h2>Accounts</h2>
-    <div class="kv" id="accounts"></div>
+    <div id="accounts-grid" class="grid"></div>
+    <div class="kv" id="accounts-extra" style="margin-top:8px"></div>
   </section>
 
   <section class="card">
@@ -218,9 +230,11 @@ async function refresh() {
     }
 
     if (status.accounts) {
-      kv(document.getElementById("accounts"), status.accounts);
+      renderAccounts(status.accounts);
     } else {
-      kv(document.getElementById("accounts"), { "(no accounts loaded)": "" });
+      document.getElementById("accounts-grid").innerHTML =
+        '<div class="stat"><div class="lbl">no accounts loaded</div></div>';
+      document.getElementById("accounts-extra").innerHTML = "";
     }
 
     const qbody = document.querySelector("#queues tbody");
@@ -271,6 +285,35 @@ async function togglePlugin(name, enabled) {
     await api(`/plugins/${name}/${enabled ? "disable" : "enable"}`, { method: "POST" });
     refresh();
   } catch (e) { alert(e.message); }
+}
+
+function statCard(label, value, cls) {
+  return `<div class="stat ${cls || ''}">
+    <div class="num">${value ?? 0}</div>
+    <div class="lbl">${label}</div>
+  </div>`;
+}
+
+function renderAccounts(p) {
+  const grid = document.getElementById("accounts-grid");
+  grid.innerHTML = [
+    statCard("Total", p.total),
+    statCard("Pending", p.pending, "warn"),
+    statCard("Running", p.running),
+    statCard("Completed", p.completed, "ok"),
+    statCard("Failed", p.failed, "err"),
+    statCard("Skipped", p.skipped || 0, "warn"),
+  ].join("");
+  const speed = (p.speed_per_minute || 0).toFixed(2);
+  kv(document.getElementById("accounts-extra"), {
+    "Speed (acct/min)": speed,
+    "Completion rate": (100 * (p.completion_rate || 0)).toFixed(1) + "%",
+    "Failure rate": (100 * (p.failure_rate || 0)).toFixed(1) + "%",
+    "Rejected": p.rejected || 0,
+    "Last loaded": p.last_loaded_at
+      ? new Date(p.last_loaded_at * 1000).toLocaleTimeString()
+      : "—",
+  });
 }
 
 refresh();

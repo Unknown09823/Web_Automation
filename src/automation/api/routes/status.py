@@ -32,7 +32,7 @@ async def get_status(request: Request, _actor: str = Depends(auth_required)) -> 
             "jobs": [j.name for j in ctx.engine.scheduler.list_jobs()],
         },
         "queues": ctx.engine.queue_manager.stats(),
-        "accounts": ctx.accounts.stats() if ctx.accounts else None,
+        "accounts": ctx.accounts.progress() if ctx.accounts else None,
         "browser_sessions": (
             list(ctx.browser.sessions.keys()) if ctx.browser else []
         ),
