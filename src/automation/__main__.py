@@ -77,9 +77,13 @@ async def _run_server(
 
     # Late imports so logging is configured first.
     from automation.accounts.manager import AccountManager
+    from automation.agent.adaptive_executor import AdaptiveExecutor
     from automation.agent.agent import BrowserAgent
+    from automation.agent.execution_template import ExecutionTemplateStore
     from automation.agent.nl_planner import NLPlanner
     from automation.agent.site_memory import SiteMemory
+    from automation.agent.template_recorder import TemplateRecorder
+    from automation.agent.template_replayer import TemplateReplayer
     from automation.agent.templates import TemplateStore
     from automation.ai.brain import AIBrain
     from automation.ai.llm import build_llm_from_settings
@@ -140,6 +144,19 @@ async def _run_server(
         root=settings.get("memory.site_memory_dir", "data/learning/sites"),
     )
 
+    # Adaptive Execution Mode (token optimisation): replay-first, AI-fallback.
+    # Account #1 teaches via the brain; #2..N replay deterministically.
+    exec_template_store = ExecutionTemplateStore(
+        root=settings.get(
+            "memory.execution_templates_dir", "data/execution_templates",
+        ),
+    )
+    adaptive_executor = AdaptiveExecutor(
+        store=exec_template_store,
+        replayer=TemplateReplayer(),
+        recorder=TemplateRecorder(exec_template_store),
+    )
+
     # Browser agent (the autonomous outer loop)
     agent: BrowserAgent | None = None
     if brain:
@@ -152,6 +169,7 @@ async def _run_server(
             max_parallel=int(settings.get("execution.max_parallel_workers", 5)),
             site_memory=site_memory,
             llm=llm,
+            adaptive_executor=adaptive_executor,
         )
 
     # FastAPI app (still useful for the dashboard-ui frontend)
@@ -177,6 +195,7 @@ async def _run_server(
         templates=templates,
         site_memory=site_memory,
         nl_planner=nl_planner,
+        execution_templates=exec_template_store,
     )
     if command_center:
         await command_center.start()
@@ -227,9 +246,13 @@ async def _run_bot(master_path: str | None, env_path: str | None) -> None:
     print(settings.render_startup_banner())
 
     from automation.accounts.manager import AccountManager
+    from automation.agent.adaptive_executor import AdaptiveExecutor
     from automation.agent.agent import BrowserAgent
+    from automation.agent.execution_template import ExecutionTemplateStore
     from automation.agent.nl_planner import NLPlanner
     from automation.agent.site_memory import SiteMemory
+    from automation.agent.template_recorder import TemplateRecorder
+    from automation.agent.template_replayer import TemplateReplayer
     from automation.agent.templates import TemplateStore
     from automation.ai.brain import AIBrain
     from automation.ai.llm import build_llm_from_settings
@@ -261,6 +284,16 @@ async def _run_bot(master_path: str | None, env_path: str | None) -> None:
     site_memory = SiteMemory(
         root=settings.get("memory.site_memory_dir", "data/learning/sites"),
     )
+    exec_template_store = ExecutionTemplateStore(
+        root=settings.get(
+            "memory.execution_templates_dir", "data/execution_templates",
+        ),
+    )
+    adaptive_executor = AdaptiveExecutor(
+        store=exec_template_store,
+        replayer=TemplateReplayer(),
+        recorder=TemplateRecorder(exec_template_store),
+    )
 
     agent: BrowserAgent | None = None
     if brain:
@@ -272,6 +305,7 @@ async def _run_bot(master_path: str | None, env_path: str | None) -> None:
             max_parallel=int(settings.get("execution.max_parallel_workers", 5)),
             site_memory=site_memory,
             llm=llm,
+            adaptive_executor=adaptive_executor,
         )
 
     cc = CommandCenter.from_settings(
@@ -282,6 +316,7 @@ async def _run_bot(master_path: str | None, env_path: str | None) -> None:
         templates=templates,
         site_memory=site_memory,
         nl_planner=nl_planner,
+        execution_templates=exec_template_store,
     )
     if not cc:
         log.error("TELEGRAM_BOT_TOKEN not configured. Edit .env and try again.")

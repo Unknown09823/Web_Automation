@@ -29,6 +29,7 @@
     "enabled": true,
     "selector_memory_path": "data/learning/memory.sqlite",
     "site_memory_dir": "data/learning/sites",
+    "execution_templates_dir": "data/execution_templates",
     "max_recoveries_remembered": 50
   },
   "ai": {

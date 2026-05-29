@@ -86,6 +86,7 @@ class BrowserAgent:
         max_parallel: int = 4,
         site_memory: Any = None,
         llm: Any = None,
+        adaptive_executor: Any = None,
     ) -> None:
         self.brain = brain
         self.browser = browser
@@ -96,8 +97,17 @@ class BrowserAgent:
         # site_memory: SiteMemory — per-domain self-learning store. Optional.
         # llm:         LLMBackend — used for fuzzy goal decomposition + the
         #              supervisor's recovery brainstorming. Optional.
+        # adaptive_executor: AdaptiveExecutor — replay-first / AI-fallback
+        #              dispatcher. When set, every goal first tries to
+        #              replay a previously-learned ExecutionTemplate
+        #              before invoking the brain. This is the token-cost
+        #              optimisation that turns "1 LLM call per goal per
+        #              account" into "1 LLM call per goal across N
+        #              accounts". Optional — when None, every goal runs
+        #              through the brain (the original behaviour).
         self.site_memory = site_memory
         self.llm = llm
+        self.adaptive = adaptive_executor
 
         self.waiter = AdaptiveWaiter()
         self.verifier = SuccessVerifier()
@@ -401,6 +411,37 @@ class BrowserAgent:
         # Flush recorder
         recorder.flush()
 
+        # Adaptive Execution Mode: if this account succeeded end-to-end and
+        # we have an adaptive executor, distill its successful action ledger
+        # into one or more replayable ExecutionTemplates. This is what
+        # account #2..N will replay deterministically (no LLM calls).
+        if success and self.adaptive is not None:
+            try:
+                target_url = run.metadata.get("target_url", "") or ""
+                inputs_for_template: dict[str, Any] = {}
+                if self.accounts_manager:
+                    account = self.accounts_manager.get(account_id)
+                    if account:
+                        inputs_for_template = {
+                            "username": (
+                                account.username or account.number or account.email
+                            ),
+                            "email":    account.email,
+                            "password": account.password,
+                            "number":   account.number,
+                        }
+                self.adaptive.record_from_run(
+                    recorder.records,
+                    inputs=inputs_for_template,
+                    target_url=target_url,
+                    run_id=run.run_id,
+                    account_id=account_id,
+                )
+            except Exception:  # noqa: BLE001
+                # Recording is best-effort — never fail an account because
+                # we couldn't write a template.
+                log.exception("template recording failed (non-fatal)")
+
         # Save final memory state
         run.save_memory(account_id, {
             "goals_total": len(goals),
@@ -657,8 +698,43 @@ class BrowserAgent:
         # Take pre-action screenshot
         await run.save_screenshot(page, account_id, f"before_{ai_goal}")
 
-        # Use AI brain to perceive + plan + act
-        if self.brain:
+        # ---------- Adaptive Execution Mode (token optimisation) -----------
+        # Try replay first; brain only runs if no template exists or replay
+        # fails. The first successful account on a domain teaches the
+        # framework via TemplateRecorder; accounts #2..N replay deterministically
+        # (no LLM calls). See agent/adaptive_executor.py for the dispatch logic.
+        used_replay = False
+        if self.adaptive is not None:
+            from automation.agent.adaptive_executor import ExecutionMode
+            adaptive_result = await self.adaptive.execute(
+                page, goal, inputs,
+                target_url=run.metadata.get("target_url", ""),
+                recorder=recorder,
+            )
+            await self._emit(AgentEvent(
+                type=AgentEventType.AI_DECISION,
+                run_id=run.run_id,
+                account_id=account_id,
+                goal=goal_desc,
+                message=adaptive_result.reason or adaptive_result.mode.value,
+                data=adaptive_result.to_dict(),
+            ))
+            if adaptive_result.mode is ExecutionMode.REPLAY_OK:
+                used_replay = True
+            elif adaptive_result.mode is ExecutionMode.REPLAY_FAILED:
+                # Decay event — caller's brain path will now retry. We do
+                # not raise; the brain gets a fresh shot at the goal.
+                await self._emit(AgentEvent(
+                    type=AgentEventType.RECOVERY_STARTED,
+                    run_id=run.run_id,
+                    account_id=account_id,
+                    goal=goal_desc,
+                    message=f"Replay failed: {adaptive_result.reason}",
+                ))
+            # NO_OP / AI_USED both fall through to the brain path.
+
+        # Use AI brain to perceive + plan + act (skipped on REPLAY_OK)
+        if self.brain and not used_replay:
             await self._emit(AgentEvent(
                 type=AgentEventType.AI_DECISION,
                 run_id=run.run_id,

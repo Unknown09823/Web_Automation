@@ -61,6 +61,17 @@ appends to `data/learning/sites/<domain>.json`: known-good selectors,
 dashboard URLs, average duration per workflow, success/failure ratio.
 Future runs against the same site get faster and more reliable.
 
+**Adaptive Execution Mode (token optimisation).** Account #1 runs in full
+AI mode and the framework records the *exact* sequence of clicks, fills,
+and intelligent waits that worked into
+`data/execution_templates/<domain>/<workflow>_v<n>.json`. Accounts #2..N
+**replay that template deterministically — no LLM calls at all**. Confidence
+decays only when a real replay fails, at which point the agent
+automatically falls back to AI, recovers, and records a new version.
+Result: ~1 LLM call per (domain, workflow) instead of per (account, goal).
+Use `/templates_exec` from Telegram to inspect, and `/relearn <domain>`
+to force a fresh AI pass.
+
 **Templates.** Save a flow once with `/template_save RegisterAndLogin <text>`
 and re-run it with `/run RegisterAndLogin`.
 
@@ -125,6 +136,8 @@ That's it. From Telegram now:
 | `/config`                          | Current config (secrets masked) |
 | `/config_set <key> <value>`        | Update non-secret config; persists |
 | `/memory [domain]`                 | Self-learning memory summary or per-site detail |
+| `/templates_exec [domain]`         | Execution templates the AdaptiveExecutor records and replays (no LLM) |
+| `/relearn <domain> [workflow]`     | Wipe replay templates so the next run re-engages the AI |
 | `/workers`                         | Active browser sessions |
 | `/help`                            | Full help |
 
@@ -229,7 +242,11 @@ Web_Automation/
 │   │   ├── recorder.py / checkpoints.py / run.py
 │   │   ├── nl_planner.py / data_factory.py / goals.py / events.py
 │   │   ├── templates.py                      ← reusable templates (NEW)
-│   │   └── site_memory.py                    ← per-site self-learning (NEW)
+│   │   ├── site_memory.py                    ← per-site self-learning (NEW)
+│   │   ├── execution_template.py             ← deterministic replay templates (NEW)
+│   │   ├── template_recorder.py              ← ledger → template (NEW)
+│   │   ├── template_replayer.py              ← deterministic Page executor (NEW)
+│   │   └── adaptive_executor.py              ← replay-first / AI-fallback (NEW)
 │   ├── browser/manager.py
 │   ├── accounts/manager.py + store.py
 │   ├── api/ (FastAPI control plane — still served alongside Telegram)
@@ -237,6 +254,7 @@ Web_Automation/
 ├── data/
 │   ├── runs/<run_id>/...                     (per-run memory folder)
 │   ├── templates/<name>.json                 (saved templates)
+│   ├── execution_templates/<domain>/<wf>_vN.json  (replay templates)
 │   ├── learning/sites/<domain>.json          (per-site memory)
 │   ├── learning/memory.sqlite                (selector memory)
 │   ├── state/, profiles/, screenshots/, downloads/, logs/
@@ -266,9 +284,10 @@ Web_Automation/
 ## Tests
 
 ```bash
-PYTHONPATH=src python3.12 scripts/test_telegram_first.py     # 59 checks
-PYTHONPATH=src python3.12 scripts/test_smoke_subset.py       # 6 checks
-PYTHONPATH=src python3.12 scripts/test_agent.py              # 20 checks
+PYTHONPATH=src python3.12 scripts/test_adaptive_execution.py   # 69 checks (replay layer)
+PYTHONPATH=src python3.12 scripts/test_telegram_first.py       # 59 checks
+PYTHONPATH=src python3.12 scripts/test_smoke_subset.py         # 6 checks
+PYTHONPATH=src python3.12 scripts/test_agent.py                # 20 checks
 ```
 
 

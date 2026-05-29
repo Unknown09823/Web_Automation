@@ -93,6 +93,9 @@ HELP_TEXT = """\
 /config                       Show current configuration (secrets masked)
 /config_set <key> <value>     Update a non-secret setting
 /memory [domain]              Show self-learning memory (per-site)
+/templates_exec [domain]      Execution templates (replay layer that
+                              skips the LLM after account #1)
+/relearn <domain> [workflow]  Force AI on the next run instead of replay
 /workers                      Show active browser workers
 /help                         This help
 """
@@ -477,6 +480,7 @@ class CommandCenter:
         templates: Any = None,
         site_memory: Any = None,
         nl_planner: Any = None,
+        execution_templates: Any = None,
         runs_root: str | Path = "data/runs",
         allowed_chat_ids: list[int] | None = None,
         live_update_interval: float = 4.0,
@@ -489,6 +493,10 @@ class CommandCenter:
         self.templates = templates
         self.site_memory = site_memory
         self.nl_planner = nl_planner
+        # ExecutionTemplateStore — surfaced via /templates_exec for operators
+        # to inspect / promote / delete the deterministic replay templates
+        # that the AdaptiveExecutor records and replays.
+        self.execution_templates = execution_templates
         self.runs_root = Path(runs_root)
         self.allowed = set(int(x) for x in (allowed_chat_ids or []) if str(x).strip())
         self.live_update_interval = live_update_interval
@@ -510,6 +518,7 @@ class CommandCenter:
         templates: Any = None,
         site_memory: Any = None,
         nl_planner: Any = None,
+        execution_templates: Any = None,
     ) -> "CommandCenter | None":
         token = settings.get_secret("TELEGRAM_BOT_TOKEN")
         if not token:
@@ -524,6 +533,7 @@ class CommandCenter:
             templates=templates,
             site_memory=site_memory,
             nl_planner=nl_planner,
+            execution_templates=execution_templates,
             runs_root=settings.get("runs.path", "data/runs"),
             allowed_chat_ids=settings.telegram_allowed_chat_ids(),
             live_update_interval=float(
@@ -1239,6 +1249,130 @@ class CommandCenter:
             lines.append(f"  {mark} `{acc}` · profile=`{profile}`")
         await self._reply(state.chat_id, "\n".join(lines))
 
+    # --------------------- execution templates (adaptive) ----------------
+    async def _cmd_templates_exec(self, state: ChatState, args: str) -> None:
+        """Surface the deterministic-replay templates the AdaptiveExecutor
+        records and uses to skip the LLM after account #1.
+
+        Forms:
+          /templates_exec                 — global summary
+          /templates_exec <domain>        — per-domain detail
+        """
+        store = self.execution_templates
+        if store is None:
+            await self._reply(
+                state.chat_id, "Execution template store not configured.",
+            )
+            return
+        domain = args.strip().lower()
+        if not domain:
+            summary = store.summary()
+            domains = summary.get("domains", []) or []
+            if not domains:
+                await self._reply(
+                    state.chat_id,
+                    "_no execution templates yet — run a goal once and one "
+                    "will be recorded automatically_",
+                )
+                return
+            lines = [
+                f"*Execution templates* — {len(domains)} domain(s)",
+                "",
+            ]
+            for d in domains[:20]:
+                lines.append(f"*{d['domain']}*")
+                for w in d.get("workflows", []):
+                    lines.append(
+                        f"  · `{w['workflow']}` v{w['latest_version']}  "
+                        f"conf={w['confidence']:.2f}  "
+                        f"replays={w['replays_succeeded']}/"
+                        f"{w['replays_attempted']}  "
+                        f"avg={w['avg_duration_ms']}ms",
+                    )
+            await self._reply(state.chat_id, "\n".join(lines))
+            return
+
+        templates = store.list_for_domain(domain)
+        if not templates:
+            await self._reply(
+                state.chat_id, f"No execution templates for `{domain}`.",
+            )
+            return
+        # Group by workflow, show latest version of each + per-version stats
+        by_wf: dict[str, list[Any]] = {}
+        for t in templates:
+            by_wf.setdefault(t.workflow, []).append(t)
+        lines = [f"*Execution templates for {domain}*", ""]
+        for wf, versions in by_wf.items():
+            versions.sort(key=lambda x: x.version, reverse=True)
+            latest = versions[0]
+            lines.append(
+                f"*{wf}* — latest v{latest.version} · "
+                f"confidence={latest.confidence:.2f}  "
+                f"({len(versions)} version(s))",
+            )
+            lines.append(
+                f"  replays: {latest.stats.replays_succeeded}/"
+                f"{latest.stats.replays_attempted} succeeded · "
+                f"avg {int(latest.stats.avg_duration_ms)}ms · "
+                f"actions={len(latest.actions)}",
+            )
+            if latest.input_keys_required:
+                lines.append(
+                    "  inputs needed: "
+                    + ", ".join(f"`{k}`" for k in sorted(latest.input_keys_required)),
+                )
+            if latest.stats.last_failure_reason:
+                lines.append(
+                    f"  last failure: _{_clip(latest.stats.last_failure_reason, 80)}_",
+                )
+            lines.append("")
+        await self._reply(state.chat_id, "\n".join(lines))
+
+    async def _cmd_relearn(self, state: ChatState, args: str) -> None:
+        """Delete the highest-confidence template for (domain[, workflow])
+        so the next run on that domain re-engages the AI brain and records
+        a fresh template version.
+
+          /relearn example.com                 — wipe ALL workflows
+          /relearn example.com register_account — wipe just one workflow
+        """
+        store = self.execution_templates
+        if store is None:
+            await self._reply(
+                state.chat_id, "Execution template store not configured.",
+            )
+            return
+        parts = args.strip().split()
+        if not parts:
+            await self._reply(
+                state.chat_id,
+                "Usage: `/relearn <domain> [workflow]`",
+            )
+            return
+        domain = parts[0]
+        workflow = parts[1] if len(parts) > 1 else None
+        templates = store.list_for_domain(domain)
+        if workflow:
+            templates = [t for t in templates if t.workflow == workflow]
+        if not templates:
+            await self._reply(
+                state.chat_id,
+                f"No matching execution templates to relearn for `{domain}`"
+                + (f" / `{workflow}`" if workflow else ""),
+            )
+            return
+        deleted = 0
+        for t in templates:
+            if store.delete(t.domain, t.workflow, t.version):
+                deleted += 1
+        await self._reply(
+            state.chat_id,
+            f"🧹 Cleared {deleted} template(s) for `{domain}`"
+            + (f" / `{workflow}`" if workflow else "")
+            + ". Next run will re-engage the AI and record a fresh template.",
+        )
+
     # ------------------------------------------------------------------ I/O
     async def _reply(
         self,
@@ -1389,6 +1523,9 @@ _COMMAND_TABLE: dict[str, Callable[[CommandCenter, ChatState, str], Awaitable[No
     "config_set":       CommandCenter._cmd_config_set,
     "memory":           CommandCenter._cmd_memory,
     "workers":          CommandCenter._cmd_workers,
+    "templates_exec":   CommandCenter._cmd_templates_exec,
+    "exec_templates":   CommandCenter._cmd_templates_exec,  # alias
+    "relearn":          CommandCenter._cmd_relearn,
 }
 
 
