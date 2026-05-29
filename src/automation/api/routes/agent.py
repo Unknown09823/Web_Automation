@@ -535,3 +535,20 @@ async def list_screenshots(
         "count": len(paths),
         "paths": paths,
     }
+
+
+
+@router.get("/ai/cost")
+async def get_ai_cost(
+    request: Request, _: str = Depends(auth_required),
+) -> dict:
+    """Return AI cost tracking statistics.
+
+    Includes: ai_calls, tokens, template_replays, heuristic_hits,
+    savings percentage, estimated cost in USD.
+    """
+    ctx = get_context(request)
+    agent = _get_agent(ctx)
+    if hasattr(agent, "cost_tracker"):
+        return agent.cost_tracker.to_dict()
+    return {"enabled": False, "error": "cost tracker not available"}

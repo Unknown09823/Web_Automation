@@ -215,6 +215,14 @@ _GOAL_KEYWORDS: dict[str, GoalType] = {
     "confirm email": GoalType.VERIFY_EMAIL,
 
     # File ops + tasks
+    "download report": GoalType.DOWNLOAD_REPORT,
+    "export report": GoalType.DOWNLOAD_REPORT,
+    "generate report": GoalType.DOWNLOAD_REPORT,
+    "get report": GoalType.DOWNLOAD_REPORT,
+    "upload document": GoalType.UPLOAD_DOCUMENT,
+    "upload file": GoalType.UPLOAD_DOCUMENT,
+    "attach document": GoalType.UPLOAD_DOCUMENT,
+    "submit document": GoalType.UPLOAD_DOCUMENT,
     "download": GoalType.DOWNLOAD_FILE,
     "upload": GoalType.UPLOAD_FILE,
     "purchase": GoalType.PURCHASE_ITEM,
@@ -273,6 +281,79 @@ _GOAL_KEYWORDS: dict[str, GoalType] = {
     "cash out": GoalType.WITHDRAW,
     "cashout": GoalType.WITHDRAW,
     "withdraw": GoalType.WITHDRAW,
+
+    # ----- v3: arbitrary task vocabulary -----
+    # Wallet / balance
+    "open wallet": GoalType.OPEN_WALLET,
+    "check wallet": GoalType.OPEN_WALLET,
+    "my wallet": GoalType.OPEN_WALLET,
+    "check balance": GoalType.CHECK_BALANCE,
+    "view balance": GoalType.CHECK_BALANCE,
+    "account balance": GoalType.CHECK_BALANCE,
+
+    # Profile
+    "complete profile": GoalType.COMPLETE_PROFILE,
+    "fill profile": GoalType.COMPLETE_PROFILE,
+    "update profile": GoalType.COMPLETE_PROFILE,
+    "edit profile": GoalType.COMPLETE_PROFILE,
+    "submit profile": GoalType.COMPLETE_PROFILE,
+
+    # Promotions / referrals
+    "join promotion": GoalType.JOIN_PROMOTION,
+    "join promo": GoalType.JOIN_PROMOTION,
+    "opt in": GoalType.JOIN_PROMOTION,
+    "activate promotion": GoalType.JOIN_PROMOTION,
+    "refer friend": GoalType.REFER_FRIEND,
+    "refer a friend": GoalType.REFER_FRIEND,
+    "invite friend": GoalType.REFER_FRIEND,
+    "send referral": GoalType.REFER_FRIEND,
+
+    # Reports / downloads (moved to top of file-ops section)
+
+    # Upload (moved to top of file-ops section)
+
+    # Forms
+    "submit form": GoalType.SUBMIT_FORM,
+    "fill form": GoalType.SUBMIT_FORM,
+    "complete form": GoalType.SUBMIT_FORM,
+
+    # Dashboard
+    "open dashboard": GoalType.OPEN_DASHBOARD,
+    "go to dashboard": GoalType.OPEN_DASHBOARD,
+    "go home": GoalType.OPEN_DASHBOARD,
+
+    # Terms
+    "accept terms": GoalType.ACCEPT_TERMS,
+    "agree to terms": GoalType.ACCEPT_TERMS,
+    "accept conditions": GoalType.ACCEPT_TERMS,
+
+    # KYC
+    "complete kyc": GoalType.COMPLETE_KYC,
+    "verify identity": GoalType.COMPLETE_KYC,
+    "identity verification": GoalType.COMPLETE_KYC,
+    "kyc verification": GoalType.COMPLETE_KYC,
+
+    # Transfer
+    "transfer funds": GoalType.TRANSFER_FUNDS,
+    "send money": GoalType.TRANSFER_FUNDS,
+    "send funds": GoalType.TRANSFER_FUNDS,
+
+    # Password
+    "change password": GoalType.CHANGE_PASSWORD,
+    "update password": GoalType.CHANGE_PASSWORD,
+    "reset password": GoalType.CHANGE_PASSWORD,
+
+    # 2FA
+    "enable 2fa": GoalType.ENABLE_2FA,
+    "enable two factor": GoalType.ENABLE_2FA,
+    "setup 2fa": GoalType.ENABLE_2FA,
+    "activate 2fa": GoalType.ENABLE_2FA,
+
+    # Support
+    "contact support": GoalType.CONTACT_SUPPORT,
+    "open support": GoalType.CONTACT_SUPPORT,
+    "help desk": GoalType.CONTACT_SUPPORT,
+    "submit ticket": GoalType.CONTACT_SUPPORT,
 }
 
 
