@@ -51,7 +51,12 @@
     "default_timeout_seconds": 120,
     "adaptive_wait_poll_ms": 200,
     "dom_settle_ms": 500,
-    "verification_threshold": 0.6
+    "verification_threshold": 0.6,
+    "deterministic_first": true,
+    "popup_guard_enabled": true,
+    "site_memory_root": "data/learning/sites",
+    "template_store_root": "data/learning/templates",
+    "rules_path": null
   },
   "plugins": {
     "paths": ["plugins_external"],

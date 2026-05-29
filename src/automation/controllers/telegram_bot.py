@@ -323,6 +323,61 @@ class TelegramController:
             await self._cancel_run(sess, token)
             return
 
+        # ---------- v2 control-center actions ---------------------------
+        # ``token`` is the run_id for these actions (set when the inline
+        # keyboard is constructed in ``_execute_pending``).
+        if action == "pause":
+            await self._answer_callback(cq_id, "pausing…")
+            try:
+                resp = await self._api("POST", f"/agent/runs/{token}/pause")
+            except _ApiError as exc:
+                await self._send(chat_id, f"pause failed: {exc}")
+                return
+            await self._send(
+                chat_id, f"⏸ paused {token} ({resp.get('status', 'paused')})",
+            )
+            return
+
+        if action == "resume":
+            await self._answer_callback(cq_id, "resuming…")
+            try:
+                resp = await self._api(
+                    "POST", f"/agent/runs/{token}/resume_paused",
+                )
+            except _ApiError as exc:
+                await self._send(chat_id, f"resume failed: {exc}")
+                return
+            await self._send(
+                chat_id, f"▶ resumed {token} ({resp.get('status', 'running')})",
+            )
+            return
+
+        if action == "status":
+            await self._answer_callback(cq_id, "fetching status…")
+            try:
+                resp = await self._api("GET", f"/agent/runs/{token}")
+            except _ApiError as exc:
+                await self._send(chat_id, f"status failed: {exc}")
+                return
+            await self._send(chat_id, _format_run_status(resp))
+            return
+
+        if action == "reasoning":
+            await self._answer_callback(cq_id, "fetching reasoning…")
+            await self._send_reasoning(sess, run_id=token)
+            return
+
+        if action == "screenshots":
+            await self._answer_callback(cq_id, "fetching screenshots…")
+            await self._send_screenshots(sess, run_id=token)
+            return
+
+        if action == "replay":
+            await self._answer_callback(cq_id, "fetching replay…")
+            text = await self._format_replay(token, None)
+            await self._send(chat_id, text or f"no replay data for {token}")
+            return
+
         await self._answer_callback(cq_id, f"unknown action: {action}", alert=True)
 
     # ---------------------------------------------------------- session util
@@ -482,6 +537,47 @@ class TelegramController:
             if not run_id:
                 return "usage: /cancel <run_id>"
             await self._cancel_run(sess, run_id)
+            raise _Reply("")
+
+        # ---------- v2 control-center commands --------------------------
+        if cmd == "pause":
+            run_id = args[0] if args else (sess.last_run_id or "")
+            if not run_id:
+                return "usage: /pause [run_id]"
+            try:
+                resp = await self._api("POST", f"/agent/runs/{run_id}/pause")
+            except _ApiError as exc:
+                return f"pause failed: {exc}"
+            return f"⏸ paused {run_id}: {resp.get('status', 'paused')}"
+
+        if cmd == "resume_paused":
+            # Distinct from /resume (resume from checkpoint). This lifts
+            # an in-flight pause without re-running anything.
+            run_id = args[0] if args else (sess.last_run_id or "")
+            if not run_id:
+                return "usage: /resume_paused [run_id]"
+            try:
+                resp = await self._api(
+                    "POST", f"/agent/runs/{run_id}/resume_paused",
+                )
+            except _ApiError as exc:
+                return f"resume_paused failed: {exc}"
+            return f"▶ resumed {run_id}: {resp.get('status', 'running')}"
+
+        if cmd == "reasoning":
+            run_id = args[0] if args else (sess.last_run_id or "")
+            if not run_id:
+                return "usage: /reasoning <run_id> [account_id]"
+            account_id = args[1] if len(args) > 1 else None
+            await self._send_reasoning(sess, run_id=run_id, account_id=account_id)
+            raise _Reply("")
+
+        if cmd == "screenshots":
+            run_id = args[0] if args else (sess.last_run_id or "")
+            if not run_id:
+                return "usage: /screenshots <run_id> [account_id]"
+            account_id = args[1] if len(args) > 1 else None
+            await self._send_screenshots(sess, run_id=run_id, account_id=account_id)
             raise _Reply("")
 
         if cmd == "resume":
@@ -647,19 +743,32 @@ class TelegramController:
         accounts = resp.get("accounts") or []
         sess.last_run_id = run_id
 
-        # Inline buttons: tap-to-watch / tap-to-cancel.
+        # Inline buttons: a compact "control center" right next to the
+        # run announcement. Telegram caps each row at ~8 buttons but
+        # readability caps it earlier; two short rows look best on
+        # both desktop and mobile.
         markup = json.dumps({
-            "inline_keyboard": [[
-                {"text": "Watch", "callback_data": f"watch:{run_id}"},
-                {"text": "Cancel run", "callback_data": f"stop:{run_id}"},
-            ]],
+            "inline_keyboard": [
+                [
+                    {"text": "👀 Watch",      "callback_data": f"watch:{run_id}"},
+                    {"text": "⏸ Pause",       "callback_data": f"pause:{run_id}"},
+                    {"text": "▶ Resume",     "callback_data": f"resume:{run_id}"},
+                    {"text": "❌ Stop",       "callback_data": f"stop:{run_id}"},
+                ],
+                [
+                    {"text": "📊 Status",      "callback_data": f"status:{run_id}"},
+                    {"text": "🧠 Reasoning",   "callback_data": f"reasoning:{run_id}"},
+                    {"text": "📷 Screenshots", "callback_data": f"screenshots:{run_id}"},
+                    {"text": "🔄 Replay",      "callback_data": f"replay:{run_id}"},
+                ],
+            ],
         })
         msg = (
             f"started {run_id}\n"
             f"accounts: {len(accounts)}\n"
             f"goals:    {resp.get('goals', '?')}\n"
             f"target:   {resp.get('target_url') or '(none)'}\n"
-            "tap Watch to stream live progress here."
+            "tap a button below to control or inspect this run."
         )
         await self._send(sess.chat_id, msg, reply_markup=markup)
 
@@ -848,6 +957,103 @@ class TelegramController:
             return f"no replay records for {account_id}"
         return _format_replay_records(run_id, account_id, replay)
 
+    # ----------------------------------------------------------- v2 helpers
+    async def _send_reasoning(
+        self,
+        sess: ChatSession,
+        *,
+        run_id: str,
+        account_id: str | None = None,
+    ) -> None:
+        """Render the most recent reasoning entries for one account.
+
+        When ``account_id`` is None the helper picks the first account
+        listed on the run summary, which is the most useful default for
+        a single-account run started from this very chat.
+        """
+        if not account_id:
+            try:
+                run = (await self._api("GET", f"/agent/runs/{run_id}")).get("run") or {}
+            except _ApiError as exc:
+                await self._send(sess.chat_id, f"reasoning failed: {exc}")
+                return
+            accs = run.get("accounts") or []
+            if not accs:
+                await self._send(sess.chat_id, "no accounts in run")
+                return
+            account_id = accs[0]
+        try:
+            data = await self._api(
+                "GET",
+                f"/agent/runs/{run_id}/reasoning/{account_id}?n=5",
+            )
+        except _ApiError as exc:
+            await self._send(sess.chat_id, f"reasoning failed: {exc}")
+            return
+        entries = data.get("entries") or []
+        if not entries:
+            await self._send(
+                sess.chat_id,
+                f"🧠 no reasoning entries yet for {account_id} in {run_id}",
+            )
+            return
+        # Render newest-first; cap at 4 blocks so we stay under the
+        # 4096-char Telegram limit even for verbose entries.
+        blocks = []
+        for e in entries[:4]:
+            blocks.append(_format_reasoning_block(e))
+        await self._send(
+            sess.chat_id,
+            f"🧠 reasoning for {account_id} (run {run_id})\n\n"
+            + "\n\n".join(blocks),
+        )
+
+    async def _send_screenshots(
+        self,
+        sess: ChatSession,
+        *,
+        run_id: str,
+        account_id: str | None = None,
+    ) -> None:
+        """Send a list of recent screenshot file paths for an account.
+
+        We do not upload the images themselves (the framework is
+        designed to run on a private host where the bot may not have
+        internet access to Telegram's CDN); instead we send the paths
+        so operators can fetch them via SCP / shared volume.
+        """
+        if not account_id:
+            try:
+                run = (await self._api("GET", f"/agent/runs/{run_id}")).get("run") or {}
+            except _ApiError as exc:
+                await self._send(sess.chat_id, f"screenshots failed: {exc}")
+                return
+            accs = run.get("accounts") or []
+            if not accs:
+                await self._send(sess.chat_id, "no accounts in run")
+                return
+            account_id = accs[0]
+        try:
+            data = await self._api(
+                "GET",
+                f"/agent/runs/{run_id}/screenshots/{account_id}?limit=10",
+            )
+        except _ApiError as exc:
+            await self._send(sess.chat_id, f"screenshots failed: {exc}")
+            return
+        paths = data.get("paths") or []
+        if not paths:
+            await self._send(
+                sess.chat_id,
+                f"📷 no screenshots for {account_id} in {run_id}",
+            )
+            return
+        msg = (
+            f"📷 latest {len(paths)} screenshots for {account_id} (run {run_id})\n\n"
+            + "\n".join(paths)
+        )
+        await self._send(sess.chat_id, msg)
+
     async def _format_templates(self) -> str:
         try:
             data = await self._api("GET", "/ai/templates")
@@ -998,7 +1204,11 @@ _HELP = (
     "  /watch [run_id]        stream live progress\n"
     "  /unwatch [run_id]      stop streaming\n"
     "  /cancel [run_id]       cancel a running execution\n"
-    "  /resume <run_id>       resume from checkpoint\n"
+    "  /pause [run_id]        ⏸ pause an active run between goals\n"
+    "  /resume_paused [r_id]  ▶ lift a /pause (in-flight)\n"
+    "  /resume <run_id>       resume from checkpoint (post-crash)\n"
+    "  /reasoning <r> [acc]   🧠 show last reasoning entries\n"
+    "  /screenshots <r> [acc] 📷 list recent screenshots\n"
     "  /replay <run_id> [acc] show replay summary\n"
     "  /templates             list learned templates\n"
     "  /runs [N]              recent runs\n"
@@ -1180,3 +1390,74 @@ def _summary(data: Any, keys: tuple[str, ...] | None = None) -> str:
             return "\n".join(f"{k}: {data.get(k)}" for k in keys)
         return json.dumps(data, indent=2, default=str)[:_MAX_TG_CHARS]
     return str(data)
+
+
+
+def _format_run_status(resp: dict[str, Any]) -> str:
+    """Format the response of ``GET /agent/runs/{id}`` for a chat reply.
+
+    Picks just the fields a human cares about (status, accounts,
+    started/finished timestamps, error if any) so the chat doesn't
+    drown in JSON.
+    """
+    run = resp.get("run") or resp
+    status = run.get("status") or "unknown"
+    accounts = run.get("accounts") or []
+    goals_total = len(run.get("goals") or [])
+    started = run.get("started_at")
+    completed = run.get("completed_at")
+    err = run.get("error")
+    lines = [
+        f"📊 Run: {run.get('run_id', '?')}",
+        f"   status:    {status}",
+        f"   accounts:  {len(accounts)}  ({', '.join(accounts[:3])}"
+        + (f", +{len(accounts) - 3} more" if len(accounts) > 3 else "")
+        + ")",
+        f"   goals:     {goals_total}",
+    ]
+    if started:
+        lines.append(f"   started:   {started}")
+    if completed:
+        lines.append(f"   completed: {completed}")
+    if err:
+        lines.append(f"   error:     {err}")
+    if resp.get("active"):
+        lines.append("   (live)")
+    return "\n".join(lines)
+
+
+def _format_reasoning_block(entry: dict[str, Any]) -> str:
+    """Format one ReasoningEntry dict as a five-line panel.
+
+    Mirrors :py:meth:`automation.agent.reasoning.ReasoningEntry.render`
+    so chat output stays consistent with the on-disk log even when
+    the entry comes from the API rather than directly from the class.
+    """
+    goal_index = entry.get("goal_index", 0)
+    goal = entry.get("goal", "")
+    obs = entry.get("observation", "")
+    reasoning = entry.get("reasoning", "")
+    action = entry.get("action", "")
+    verification = entry.get("verification", "")
+    source = entry.get("source", "?")
+    confidence = entry.get("confidence", 0.0)
+    success = entry.get("success", True)
+    error = entry.get("error")
+    pieces = [
+        f"Goal #{goal_index}: {goal}",
+        f"Observation: {_short(obs)}",
+        f"Reasoning:   {_short(reasoning)} [{source} conf={confidence:.2f}]",
+        f"Action:      {_short(action)}",
+        f"Verification: {_short(verification)} ({'pass' if success else 'fail'})",
+    ]
+    if error:
+        pieces.append(f"Error: {_short(error)}")
+    return "\n".join(pieces)
+
+
+def _short(text: str, n: int = 220) -> str:
+    """Truncate a single line so the panel renders in Telegram."""
+    if not text:
+        return ""
+    text = str(text).replace("\n", " ").strip()
+    return text if len(text) <= n else text[: n - 1] + "…"

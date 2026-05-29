@@ -115,6 +115,37 @@ def _pretty_keyword(keyword: str) -> str:
     return keyword.replace("_", " ").title()
 
 
+# How short is "short" for word-boundary matching? Keywords with no
+# spaces and at most this many characters get the \b...\b treatment so
+# they don't match inside longer words ("register" vs "registered",
+# "claim" vs "reclaim", "bet" vs "better"). Multi-word phrases already
+# self-anchor through their spaces so we don't need boundaries there.
+_SHORT_KW_THRESHOLD = 8
+
+
+def _kw_in(haystack: str, keyword: str) -> bool:
+    """``True`` when ``keyword`` appears as a whole word/phrase in ``haystack``.
+
+    Used by the goal extractor to avoid false-positive matches inside
+    longer words.
+    """
+    if " " in keyword or len(keyword) > _SHORT_KW_THRESHOLD:
+        return keyword in haystack
+    return re.search(rf"\b{re.escape(keyword)}\b", haystack) is not None
+
+
+def _kw_find(haystack: str, keyword: str) -> int:
+    """Index of the first whole-word occurrence of ``keyword``, or -1.
+
+    Mirrors ``_kw_in`` semantics so pass 1 and pass 2 of the goal
+    extractor agree on what counts as a match.
+    """
+    if " " in keyword or len(keyword) > _SHORT_KW_THRESHOLD:
+        return haystack.find(keyword)
+    m = re.search(rf"\b{re.escape(keyword)}\b", haystack)
+    return m.start() if m else -1
+
+
 
 # --------------------------------------------------------------------------
 # LLM Backend interface (stub for Phase 2)
@@ -158,25 +189,90 @@ _NUMBER_LENGTH_PATTERNS = [
 ]
 
 _GOAL_KEYWORDS: dict[str, GoalType] = {
-    "register": GoalType.REGISTER_ACCOUNT,
+    # ----- multi-word phrases first (longer-match-wins for free) -----
+    # Register / sign-up
+    "create account": GoalType.REGISTER_ACCOUNT,
+    "create an account": GoalType.REGISTER_ACCOUNT,
     "sign up": GoalType.REGISTER_ACCOUNT,
     "signup": GoalType.REGISTER_ACCOUNT,
-    "create account": GoalType.REGISTER_ACCOUNT,
-    "login": GoalType.LOGIN,
+    "join now": GoalType.REGISTER_ACCOUNT,
+    "register": GoalType.REGISTER_ACCOUNT,
+
+    # Login
     "log in": GoalType.LOGIN,
     "sign in": GoalType.LOGIN,
+    "login": GoalType.LOGIN,
+
+    # Logout
+    "log out": GoalType.LOGOUT,
+    "sign out": GoalType.LOGOUT,
+    "logout": GoalType.LOGOUT,
+
+    # Onboarding / verify
+    "complete onboarding": GoalType.COMPLETE_ONBOARDING,
+    "onboarding": GoalType.COMPLETE_ONBOARDING,
+    "verify email": GoalType.VERIFY_EMAIL,
+    "confirm email": GoalType.VERIFY_EMAIL,
+
+    # File ops + tasks
     "download": GoalType.DOWNLOAD_FILE,
     "upload": GoalType.UPLOAD_FILE,
     "purchase": GoalType.PURCHASE_ITEM,
     "buy": GoalType.PURCHASE_ITEM,
     "fill application": GoalType.FILL_APPLICATION,
     "apply": GoalType.FILL_APPLICATION,
-    "onboarding": GoalType.COMPLETE_ONBOARDING,
-    "complete onboarding": GoalType.COMPLETE_ONBOARDING,
     "complete task": GoalType.COMPLETE_TASK,
-    "verify email": GoalType.VERIFY_EMAIL,
-    "logout": GoalType.LOGOUT,
-    "log out": GoalType.LOGOUT,
+
+    # ----- v2: deterministic-first goal vocabulary -----
+    # Rewards / bonus actions. Multi-word phrases come first so a sentence
+    # like "Claim a reward" matches CLAIM_REWARD via "claim reward" rather
+    # than the bare "claim" prefix below.
+    "claim gift": GoalType.CLAIM_REWARD,
+    "claim reward": GoalType.CLAIM_REWARD,
+    "claim bonus": GoalType.CLAIM_REWARD,
+    "claim now": GoalType.CLAIM_REWARD,
+    "redeem reward": GoalType.CLAIM_REWARD,
+    "redeem gift": GoalType.CLAIM_REWARD,
+    "redeem bonus": GoalType.CLAIM_REWARD,
+    "free spin": GoalType.CLAIM_REWARD,
+    "spin the wheel": GoalType.CLAIM_REWARD,
+    "collect reward": GoalType.CLAIM_REWARD,
+    "collect bonus": GoalType.CLAIM_REWARD,
+    "redeem": GoalType.CLAIM_REWARD,
+    "claim": GoalType.CLAIM_REWARD,
+
+    # Rewards page navigation
+    "open rewards page": GoalType.OPEN_REWARDS_PAGE,
+    "open rewards": GoalType.OPEN_REWARDS_PAGE,
+    "rewards page": GoalType.OPEN_REWARDS_PAGE,
+    "promotions page": GoalType.OPEN_REWARDS_PAGE,
+    "open promotions": GoalType.OPEN_REWARDS_PAGE,
+    "go to rewards": GoalType.OPEN_REWARDS_PAGE,
+
+    # Betting / casino navigation
+    "open betting page": GoalType.OPEN_BETTING_PAGE,
+    "open betting": GoalType.OPEN_BETTING_PAGE,
+    "betting page": GoalType.OPEN_BETTING_PAGE,
+    "open casino": GoalType.OPEN_BETTING_PAGE,
+    "go to sports": GoalType.OPEN_BETTING_PAGE,
+
+    # Place a bet (note: "place bet" is more specific than "open betting")
+    "place minimum bet": GoalType.PLACE_BET,
+    "place a bet": GoalType.PLACE_BET,
+    "place bet": GoalType.PLACE_BET,
+    "submit bet": GoalType.PLACE_BET,
+    "confirm bet": GoalType.PLACE_BET,
+
+    # Deposit / withdraw
+    "make deposit": GoalType.DEPOSIT,
+    "add funds": GoalType.DEPOSIT,
+    "top up": GoalType.DEPOSIT,
+    "deposit": GoalType.DEPOSIT,
+    "request withdrawal": GoalType.WITHDRAW,
+    "request payout": GoalType.WITHDRAW,
+    "cash out": GoalType.WITHDRAW,
+    "cashout": GoalType.WITHDRAW,
+    "withdraw": GoalType.WITHDRAW,
 }
 
 
@@ -294,7 +390,24 @@ class NLPlanner:
         )
 
     def _extract_goals(self, text: str) -> list[AgentGoal]:
-        """Extract ordered goals from text, preserving text-position order."""
+        """Extract ordered goals from text, preserving text-position order.
+
+        Matching strategy:
+          * Split the input on sentence-ish boundaries (``.``, ``,``, ``;``,
+            ``then``, ``after``, ``and``) so each clause produces at most
+            one goal.
+          * Within a clause, walk the keyword catalog in *insertion order*
+            so multi-word phrases ("claim reward", "place minimum bet")
+            beat their single-word prefixes ("claim", "bet").
+          * Use whole-word matching for short keywords (≤6 chars) so
+            "register" doesn't match inside "registered" and "claim"
+            doesn't match inside "reclaim".
+          * Pass 2 sweeps the original text to catch keywords that
+            weren't visible to the clause splitter (e.g. compound
+            sentences without a delimiter), and orders results by the
+            keyword's first occurrence in the text rather than the
+            catalog order.
+        """
         text_lower = text.lower()
         goals: list[AgentGoal] = []
         seen: set[GoalType] = set()
@@ -306,13 +419,16 @@ class NLPlanner:
             if not part:
                 continue
             for keyword, goal_type in _GOAL_KEYWORDS.items():
-                if keyword in part and goal_type not in seen:
-                    seen.add(goal_type)
-                    goals.append(AgentGoal(
-                        type=goal_type,
-                        description=_pretty_keyword(keyword),
-                    ))
-                    break
+                if goal_type in seen:
+                    continue
+                if not _kw_in(part, keyword):
+                    continue
+                seen.add(goal_type)
+                goals.append(AgentGoal(
+                    type=goal_type,
+                    description=_pretty_keyword(keyword),
+                ))
+                break
 
         # Pass 2: catch goals missed by part-splitting, ordered by their first
         # appearance in the original text (NOT by dict insertion order).
@@ -320,7 +436,7 @@ class NLPlanner:
         for keyword, goal_type in _GOAL_KEYWORDS.items():
             if goal_type in seen:
                 continue
-            idx = text_lower.find(keyword)
+            idx = _kw_find(text_lower, keyword)
             if idx >= 0:
                 missed.append((idx, goal_type, keyword))
         missed.sort(key=lambda t: t[0])
