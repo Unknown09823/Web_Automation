@@ -378,6 +378,47 @@ class TelegramController:
             await self._send(chat_id, text or f"no replay data for {token}")
             return
 
+        # Main menu navigation callbacks
+        if action == "menu":
+            await self._answer_callback(cq_id, "")
+            await self._send_main_menu(sess)
+            return
+
+        if action == "menu_run":
+            await self._answer_callback(cq_id, "")
+            sess.awaiting = "instruction"
+            await self._send(
+                chat_id,
+                "Send your task instruction now.\n\n"
+                "Example:\n"
+                "Create 5 accounts. Password: Test@123.\n"
+                "Visit https://example.com\n"
+                "Register. Login. Claim reward. Complete onboarding.",
+            )
+            return
+
+        if action == "menu_runs":
+            await self._answer_callback(cq_id, "loading…")
+            text = await self._format_runs(10)
+            await self._send(chat_id, text)
+            return
+
+        if action == "menu_templates":
+            await self._answer_callback(cq_id, "loading…")
+            text = await self._format_templates()
+            await self._send(chat_id, text)
+            return
+
+        if action == "menu_stats":
+            await self._answer_callback(cq_id, "loading…")
+            await self._send_stats(sess)
+            return
+
+        if action == "menu_settings":
+            await self._answer_callback(cq_id, "")
+            await self._send(chat_id, _HELP)
+            return
+
         await self._answer_callback(cq_id, f"unknown action: {action}", alert=True)
 
     # ---------------------------------------------------------- session util
@@ -407,11 +448,18 @@ class TelegramController:
     ) -> str:
         # ----- discovery / monitoring (kept from the old bot) ------------
         if cmd in {"start", "help", "?"}:
-            # /start is Telegram's conventional welcome (clients tap it on
-            # first open) so we surface help here rather than starting the
-            # engine. The engine-start path moved to /engine_start so it is
-            # still reachable from chat.
-            return _HELP
+            # /start sends the main menu as an inline keyboard for a
+            # consumer-grade UX, plus the help text as fallback.
+            await self._send_main_menu(sess)
+            raise _Reply("")
+
+        if cmd == "menu":
+            await self._send_main_menu(sess)
+            raise _Reply("")
+
+        if cmd == "stats":
+            await self._send_stats(sess)
+            raise _Reply("")
 
         if cmd == "status":
             return _summary(
@@ -578,6 +626,20 @@ class TelegramController:
                 return "usage: /screenshots <run_id> [account_id]"
             account_id = args[1] if len(args) > 1 else None
             await self._send_screenshots(sess, run_id=run_id, account_id=account_id)
+            raise _Reply("")
+
+        if cmd == "dashboard":
+            run_id = args[0] if args else (sess.last_run_id or "")
+            if not run_id:
+                return "usage: /dashboard [run_id]"
+            await self._send_live_dashboard(sess, run_id)
+            raise _Reply("")
+
+        if cmd == "report":
+            run_id = args[0] if args else (sess.last_run_id or "")
+            if not run_id:
+                return "usage: /report [run_id]"
+            await self._send_run_report(sess, run_id)
             raise _Reply("")
 
         if cmd == "resume":
@@ -874,6 +936,8 @@ class TelegramController:
                 status = resp.get("status")
                 if status in terminal and not buffer:
                     await self._send(sess.chat_id, f"[{run_id}] done — {status}")
+                    # Send post-run report automatically
+                    await self._send_run_report(sess, run_id)
                     break
 
                 await asyncio.sleep(_WATCH_POLL_S)
@@ -958,6 +1022,243 @@ class TelegramController:
         return _format_replay_records(run_id, account_id, replay)
 
     # ----------------------------------------------------------- v2 helpers
+    async def _send_main_menu(self, sess: ChatSession) -> None:
+        """Send the consumer-grade main menu with button grid."""
+        markup = json.dumps({
+            "inline_keyboard": [
+                [
+                    {"text": "▶ Run Task", "callback_data": "menu_run:_"},
+                    {"text": "📋 Plans", "callback_data": "menu_runs:_"},
+                ],
+                [
+                    {"text": "📊 Active Runs", "callback_data": "menu_runs:_"},
+                    {"text": "📁 Templates", "callback_data": "menu_templates:_"},
+                ],
+                [
+                    {"text": "📈 Statistics", "callback_data": "menu_stats:_"},
+                    {"text": "⚙ Settings / Help", "callback_data": "menu_settings:_"},
+                ],
+            ],
+        })
+        await self._send(
+            sess.chat_id,
+            "🤖 *Web Automation Control Center*\n\n"
+            "Choose an action below, or simply type your task as a message.\n\n"
+            "Examples:\n"
+            '• "Create 5 accounts on https://site.com"\n'
+            '• "Register, login, claim daily reward"\n'
+            '• "Download report from dashboard"',
+            reply_markup=markup,
+        )
+
+    async def _send_stats(self, sess: ChatSession) -> None:
+        """Send AI cost / performance statistics."""
+        try:
+            status_data = await self._api("GET", "/status")
+        except _ApiError:
+            status_data = {}
+
+        try:
+            ai_data = await self._api("GET", "/ai/status")
+        except _ApiError:
+            ai_data = {}
+
+        try:
+            runs_data = await self._api("GET", "/agent/runs?limit=50")
+        except _ApiError:
+            runs_data = {}
+
+        # Build stats summary
+        active_runs = runs_data.get("active") or {}
+        all_runs = runs_data.get("runs") or []
+        total_runs = len(all_runs) + len(active_runs)
+        completed = sum(1 for r in all_runs if r.get("status") == "completed")
+        failed = sum(1 for r in all_runs if r.get("status") == "failed")
+
+        ai_enabled = ai_data.get("enabled", False)
+        ai_calls = ai_data.get("total_calls", 0)
+        tokens_used = ai_data.get("total_tokens", 0)
+        template_replays = ai_data.get("template_replays", 0)
+
+        lines = [
+            "📈 *Statistics*\n",
+            f"Total Runs:        {total_runs}",
+            f"Active Now:        {len(active_runs)}",
+            f"Completed:         {completed}",
+            f"Failed:            {failed}",
+            f"Success Rate:      {(completed / max(total_runs, 1) * 100):.1f}%",
+            "",
+            "🧠 *AI Usage*",
+            f"AI Enabled:        {'Yes' if ai_enabled else 'No'}",
+            f"AI Calls:          {ai_calls}",
+            f"Tokens Used:       {tokens_used:,}",
+            f"Template Replays:  {template_replays}",
+            f"AI Savings:        {(template_replays / max(ai_calls + template_replays, 1) * 100):.1f}%",
+            "",
+            "⚡ *Engine*",
+            f"Status:            {status_data.get('status', 'unknown')}",
+        ]
+        await self._send(sess.chat_id, "\n".join(lines))
+
+    async def _send_photo(
+        self, chat_id: int, photo_path: str, caption: str = "",
+    ) -> bool:
+        """Send a photo file to a chat via Telegram's sendPhoto API.
+
+        Returns True on success. Falls back to sending the path as text
+        if the file cannot be read or the upload fails.
+        """
+        import os
+        if not os.path.isfile(photo_path):
+            await self._send(chat_id, f"📷 {caption}\n(file not found: {photo_path})")
+            return False
+
+        try:
+            import io
+            import http.client
+            from urllib.parse import urlparse
+
+            # Read file
+            with open(photo_path, "rb") as f:
+                photo_data = f.read()
+
+            # Build multipart form data
+            boundary = secrets.token_hex(16)
+            body_parts = []
+
+            # chat_id field
+            body_parts.append(f"--{boundary}\r\n".encode())
+            body_parts.append(b'Content-Disposition: form-data; name="chat_id"\r\n\r\n')
+            body_parts.append(f"{chat_id}\r\n".encode())
+
+            # caption field
+            if caption:
+                body_parts.append(f"--{boundary}\r\n".encode())
+                body_parts.append(b'Content-Disposition: form-data; name="caption"\r\n\r\n')
+                body_parts.append(f"{caption}\r\n".encode())
+
+            # photo field
+            filename = os.path.basename(photo_path)
+            body_parts.append(f"--{boundary}\r\n".encode())
+            body_parts.append(
+                f'Content-Disposition: form-data; name="photo"; filename="{filename}"\r\n'
+                f"Content-Type: image/png\r\n\r\n".encode()
+            )
+            body_parts.append(photo_data)
+            body_parts.append(b"\r\n")
+            body_parts.append(f"--{boundary}--\r\n".encode())
+
+            payload = b"".join(body_parts)
+
+            url = f"{API}/bot{self.token}/sendPhoto"
+            parsed = urlparse(url)
+            conn = http.client.HTTPSConnection(parsed.hostname, timeout=30)
+            conn.request(
+                "POST", parsed.path,
+                body=payload,
+                headers={
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                    "Content-Length": str(len(payload)),
+                },
+            )
+            resp = conn.getresponse()
+            conn.close()
+            return resp.status == 200
+
+        except Exception as exc:  # noqa: BLE001
+            log.debug("sendPhoto failed for %s: %s", photo_path, exc)
+            await self._send(chat_id, f"📷 {caption}\n(upload failed: {photo_path})")
+            return False
+
+    async def _send_live_dashboard(
+        self, sess: ChatSession, run_id: str,
+    ) -> None:
+        """Send a compact live dashboard for the current run state.
+
+        Shows per-account progress with confidence, current goal, and
+        recovery attempts — designed to be readable without scrolling.
+        """
+        try:
+            resp = await self._api("GET", f"/agent/runs/{run_id}")
+        except _ApiError as exc:
+            await self._send(sess.chat_id, f"dashboard failed: {exc}")
+            return
+
+        run = resp.get("run") or resp
+        accounts = run.get("accounts") or []
+        goals = run.get("goals") or []
+        status = run.get("status") or "unknown"
+
+        lines = [f"📊 *Live Dashboard* — {run_id}", f"Status: {status}\n"]
+
+        for i, acc_id in enumerate(accounts[:10], 1):
+            # Try to get reasoning for this account
+            try:
+                r_data = await self._api(
+                    "GET",
+                    f"/agent/runs/{run_id}/reasoning/{acc_id}?n=1",
+                )
+                entries = r_data.get("entries") or []
+            except _ApiError:
+                entries = []
+
+            if entries:
+                latest = entries[0]
+                goal = latest.get("goal", "?")
+                confidence = latest.get("confidence", 0)
+                success = latest.get("success", True)
+                source = latest.get("source", "?")
+                marker = "✓" if success else "⚠"
+                lines.append(
+                    f"{marker} Account {i}/{len(accounts)}\n"
+                    f"  Goal: {goal}\n"
+                    f"  Confidence: {int(confidence * 100)}%\n"
+                    f"  Source: {source}"
+                )
+            else:
+                lines.append(f"⏳ Account {i}/{len(accounts)} — waiting")
+
+        if len(accounts) > 10:
+            lines.append(f"\n(+{len(accounts) - 10} more accounts)")
+
+        lines.append(f"\nGoals: {len(goals)}")
+        await self._send(sess.chat_id, "\n".join(lines))
+
+    async def _send_run_report(
+        self, sess: ChatSession, run_id: str,
+    ) -> None:
+        """Send a post-completion report with success rate, AI usage, etc."""
+        try:
+            resp = await self._api("GET", f"/agent/runs/{run_id}")
+        except _ApiError as exc:
+            await self._send(sess.chat_id, f"report failed: {exc}")
+            return
+
+        run = resp.get("run") or resp
+        accounts = run.get("accounts") or []
+        status = run.get("status") or "?"
+        goals = run.get("goals") or []
+        instruction = (run.get("instruction") or "")[:100]
+        error = run.get("error")
+
+        # Count successes from memory files or just report total
+        lines = [
+            "📋 *Run Report*\n",
+            f"Run ID:      {run_id}",
+            f"Status:      {status}",
+            f"Instruction: {instruction}",
+            f"Accounts:    {len(accounts)}",
+            f"Goals:       {len(goals)}",
+        ]
+        if error:
+            lines.append(f"Error:       {error[:200]}")
+
+        lines.append("\n*Summary*")
+        lines.append(f"Processed:   {len(accounts)}")
+        lines.append(f"Total Goals: {len(goals)}")
+
+        await self._send(sess.chat_id, "\n".join(lines))
+
     async def _send_reasoning(
         self,
         sess: ChatSession,
@@ -1015,12 +1316,10 @@ class TelegramController:
         run_id: str,
         account_id: str | None = None,
     ) -> None:
-        """Send a list of recent screenshot file paths for an account.
+        """Send recent screenshots as actual images to the chat.
 
-        We do not upload the images themselves (the framework is
-        designed to run on a private host where the bot may not have
-        internet access to Telegram's CDN); instead we send the paths
-        so operators can fetch them via SCP / shared volume.
+        Sends up to 5 most recent screenshots as photos via sendPhoto.
+        Falls back to file paths if upload fails.
         """
         if not account_id:
             try:
@@ -1036,7 +1335,7 @@ class TelegramController:
         try:
             data = await self._api(
                 "GET",
-                f"/agent/runs/{run_id}/screenshots/{account_id}?limit=10",
+                f"/agent/runs/{run_id}/screenshots/{account_id}?limit=5",
             )
         except _ApiError as exc:
             await self._send(sess.chat_id, f"screenshots failed: {exc}")
@@ -1048,11 +1347,31 @@ class TelegramController:
                 f"📷 no screenshots for {account_id} in {run_id}",
             )
             return
-        msg = (
-            f"📷 latest {len(paths)} screenshots for {account_id} (run {run_id})\n\n"
-            + "\n".join(paths)
+
+        await self._send(
+            sess.chat_id,
+            f"📷 Sending {len(paths)} screenshot(s) for {account_id}…",
         )
-        await self._send(sess.chat_id, msg)
+
+        sent_count = 0
+        for i, path in enumerate(paths[:5]):
+            caption = f"Screenshot {i + 1}/{len(paths)} — {account_id}"
+            success = await self._send_photo(sess.chat_id, path, caption)
+            if success:
+                sent_count += 1
+
+        if sent_count == 0:
+            # Fallback: send as file paths if all uploads failed
+            msg = (
+                f"📷 Could not upload images. Paths:\n\n"
+                + "\n".join(paths[:5])
+            )
+            await self._send(sess.chat_id, msg)
+        elif sent_count < len(paths):
+            await self._send(
+                sess.chat_id,
+                f"({sent_count}/{len(paths)} screenshots sent successfully)",
+            )
 
     async def _format_templates(self) -> str:
         try:
@@ -1256,6 +1575,7 @@ def _format_plan_preview(
         f"  parallel:    {parallel}"
         + (f" (max {max_parallel})" if parallel and max_parallel else ""),
         f"  estimate:    {int(eta)}s",
+        f"  AI calls:    ~{len(goals) * accounts} (max, less with templates)",
         "  steps:",
     ])
     for i, g in enumerate(goals, 1):

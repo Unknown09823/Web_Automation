@@ -184,6 +184,130 @@ INTENT_GROUPS: dict[str, IntentGroup] = {
         preferred_roles=("textbox", "searchbox", "button"),
         description="Search input or trigger",
     ),
+    # ----- v3: arbitrary task intent groups ----------------------------
+    "open_wallet": IntentGroup(
+        name="open_wallet",
+        base_intents=(),
+        keywords=(
+            "wallet", "my wallet", "balance", "funds", "account balance",
+            "my balance", "money",
+        ),
+        description="Navigate to wallet / balance page",
+    ),
+    "open_reports": IntentGroup(
+        name="open_reports",
+        base_intents=(),
+        keywords=(
+            "reports", "my reports", "download report", "export",
+            "statements", "history", "transaction history",
+        ),
+        description="Navigate to reports / export section",
+    ),
+    "open_referral": IntentGroup(
+        name="open_referral",
+        base_intents=(),
+        keywords=(
+            "referral", "refer", "invite", "refer a friend",
+            "invite friends", "referral program",
+        ),
+        description="Navigate to referral page",
+    ),
+    "open_transfer": IntentGroup(
+        name="open_transfer",
+        base_intents=(),
+        keywords=(
+            "transfer", "send money", "send funds", "pay",
+            "wire transfer", "bank transfer",
+        ),
+        description="Navigate to transfer / send page",
+    ),
+    "open_security": IntentGroup(
+        name="open_security",
+        base_intents=(),
+        keywords=(
+            "security", "two-factor", "2fa", "authenticator",
+            "security settings", "privacy",
+        ),
+        description="Navigate to security settings",
+    ),
+    "open_support": IntentGroup(
+        name="open_support",
+        base_intents=(),
+        keywords=(
+            "support", "help", "contact", "chat", "live chat",
+            "help center", "customer service", "ticket",
+        ),
+        description="Navigate to support / help",
+    ),
+    "open_kyc": IntentGroup(
+        name="open_kyc",
+        base_intents=(),
+        keywords=(
+            "kyc", "verification", "identity", "verify identity",
+            "id verification", "documents",
+        ),
+        description="Navigate to KYC / identity verification",
+    ),
+    "join_promotion": IntentGroup(
+        name="join_promotion",
+        base_intents=(),
+        keywords=(
+            "join", "opt in", "activate", "enroll", "participate",
+            "join now", "opt-in", "enter now",
+        ),
+        preferred_roles=("button", "link"),
+        description="Join / opt-in to a promotion",
+    ),
+    "download": IntentGroup(
+        name="download",
+        base_intents=(),
+        keywords=(
+            "download", "export", "save", "generate pdf",
+            "download pdf", "download csv", "get file",
+        ),
+        preferred_roles=("button", "link"),
+        description="Download / export action",
+    ),
+    "upload": IntentGroup(
+        name="upload",
+        base_intents=(),
+        keywords=(
+            "upload", "attach", "choose file", "select file",
+            "browse", "drag and drop",
+        ),
+        preferred_roles=("button", "link"),
+        description="Upload / attach action",
+    ),
+    "add_to_cart": IntentGroup(
+        name="add_to_cart",
+        base_intents=(),
+        keywords=(
+            "add to cart", "add to bag", "buy now", "purchase",
+            "order now", "add",
+        ),
+        preferred_roles=("button",),
+        description="Add item to cart / buy",
+    ),
+    "enable_2fa": IntentGroup(
+        name="enable_2fa",
+        base_intents=(),
+        keywords=(
+            "enable", "activate", "turn on", "set up",
+            "configure", "enable 2fa",
+        ),
+        preferred_roles=("button",),
+        description="Enable / activate 2FA",
+    ),
+    "continue": IntentGroup(
+        name="continue",
+        base_intents=("continue",),
+        keywords=(
+            "continue", "next", "proceed", "skip", "got it",
+            "next step", "go on", "forward",
+        ),
+        preferred_roles=("button", "link"),
+        description="Continue / next step",
+    ),
     # Field intents (different role bias — passed through unchanged from
     # the matcher; included here so the heuristics layer is self-sufficient).
     "username_field": IntentGroup(

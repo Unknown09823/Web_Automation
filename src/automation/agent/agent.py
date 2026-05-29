@@ -171,6 +171,22 @@ class BrowserAgent:
                     brain=self.brain,
                 )
 
+        # Form filler — always available regardless of deterministic_first.
+        # The executor will use it for all FILL actions when present.
+        from automation.agent.form_filler import FormFiller
+        self.form_filler = FormFiller()
+
+        # Captcha handler — available for the loop's recovery path.
+        from automation.agent.captcha_handler import CaptchaHandler
+        self.captcha_handler = CaptchaHandler()
+
+        # AI cost tracker — shared across all accounts and runs.
+        from automation.agent.cost_tracker import CostTracker
+        self.cost_tracker = CostTracker(
+            persist_path=Path("data/state/cost_tracker.json"),
+        )
+        self.cost_tracker.load()  # restore from disk if available
+
         self._active_runs: dict[str, RunContext] = {}
         self._cancelled: set[str] = set()
         # Pause/resume per run. Event is *set* when running, cleared when
@@ -545,9 +561,15 @@ class BrowserAgent:
         # everything per-account lives on the loop instance.
         step_loop: StepLoop | None = None
         if self.deterministic_first and self.deterministic_engine is not None:
+            from automation.ai.executor import ActionExecutor
+            executor = ActionExecutor(
+                screenshot_dir=account_dir / "screenshots",
+                form_filler=self.form_filler,
+            )
             step_loop = StepLoop(
                 popup_guard=self.popup_guard,
                 deterministic_engine=self.deterministic_engine,
+                executor=executor,
                 verifier=self.verifier,
                 waiter=self.waiter,
                 reasoning_log=reasoning_log,
@@ -619,6 +641,9 @@ class BrowserAgent:
             account_id=account_id,
             message=f"Account {account_id} {'completed' if success else 'failed'}",
         ))
+
+        # Persist cost tracker after each account completes
+        self.cost_tracker.flush()
 
 
     # ---------------------------------------------------------------- per-goal
@@ -896,6 +921,22 @@ class BrowserAgent:
             result.plan.to_dict(),
             confidence=result.plan.confidence,
         )
+
+        # Track AI cost based on which level resolved the goal
+        from automation.agent.reasoning import DecisionSource
+        source = result.plan.source
+        if source is DecisionSource.AI:
+            self.cost_tracker.record_ai_call(goal=ai_goal)
+        elif source is DecisionSource.REPLAY:
+            self.cost_tracker.record_template_replay(goal=ai_goal)
+        elif source is DecisionSource.HEURISTIC:
+            self.cost_tracker.record_heuristic_hit(goal=ai_goal)
+        elif source is DecisionSource.SITE_MEMORY:
+            self.cost_tracker.record_site_memory_hit(goal=ai_goal)
+        elif source is DecisionSource.RULE:
+            self.cost_tracker.record_rule_hit(goal=ai_goal)
+        elif source is DecisionSource.HUMAN:
+            self.cost_tracker.record_human_handoff(goal=ai_goal)
         if result.popup_result and result.popup_result.any_dismissed:
             recorder.record_wait(
                 "popup_dismiss", True, result.popup_result.duration_ms,

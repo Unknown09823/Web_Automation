@@ -97,6 +97,36 @@ GOAL_SHAPES: dict[str, GoalShape] = {
     "withdraw": GoalShape(click_intent="withdraw"),
     "verify_email": GoalShape(click_intent="verify_email"),
     "submit": GoalShape(click_intent="submit"),
+    # ----- v3: arbitrary task shapes -----------------------------------
+    "open_wallet": GoalShape(click_intent="open_wallet"),
+    "open_profile": GoalShape(click_intent="profile"),
+    "open_dashboard": GoalShape(click_intent="dashboard"),
+    "open_reports": GoalShape(click_intent="open_reports"),
+    "open_upload": GoalShape(click_intent="upload"),
+    "open_referral": GoalShape(click_intent="open_referral"),
+    "open_transfer": GoalShape(click_intent="open_transfer"),
+    "open_security": GoalShape(click_intent="open_security"),
+    "open_support": GoalShape(click_intent="open_support"),
+    "open_kyc": GoalShape(click_intent="open_kyc"),
+    "join_promotion": GoalShape(click_intent="join_promotion"),
+    "accept_terms": GoalShape(click_intent="accept_terms"),
+    "download": GoalShape(click_intent="download"),
+    "upload": GoalShape(click_intent="upload"),
+    "continue": GoalShape(click_intent="continue"),
+    "fill_form": GoalShape(
+        form_fields=("username_field", "email_field", "phone_field", "password_field"),
+        click_intent="submit",
+        require_form=False,  # partial fills are acceptable
+    ),
+    "change_password": GoalShape(
+        form_fields=("password_field", "confirm_password_field"),
+        click_intent="submit",
+        require_form=True,
+    ),
+    "enable_2fa": GoalShape(click_intent="enable_2fa"),
+    "complete_task": GoalShape(click_intent="submit"),
+    "add_to_cart": GoalShape(click_intent="add_to_cart"),
+    "checkout": GoalShape(click_intent="submit"),
 }
 
 
