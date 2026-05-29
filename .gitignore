@@ -23,6 +23,7 @@ data/screenshots/*
 data/learning/*
 data/downloads/*
 data/runs/*
+data/templates/*
 !data/logs/.gitkeep
 !data/state/.gitkeep
 !data/profiles/.gitkeep
@@ -30,3 +31,4 @@ data/runs/*
 !data/learning/.gitkeep
 !data/downloads/.gitkeep
 !data/runs/.gitkeep
+!data/templates/.gitkeep

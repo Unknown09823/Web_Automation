@@ -1,0 +1,89 @@
+{
+  "_comment": "Single non-secret configuration file for the Telegram-first agent. Secrets live in .env. Edit this file to change non-secret behaviour. Anything here may be overridden via AUTOMATION__SECTION__KEY env variables.",
+  "environment": "production",
+  "workflows_dir": "config/workflows",
+  "browser": {
+    "engine": "chromium",
+    "viewport": {"width": 1280, "height": 800},
+    "profiles_root": "data/profiles",
+    "downloads_dir": "data/downloads",
+    "args": [],
+    "slow_mo_ms": 0
+  },
+  "execution": {
+    "default_timeout_seconds": 120,
+    "adaptive_wait_poll_ms": 200,
+    "dom_settle_ms": 500,
+    "network_idle_ms": 300,
+    "verification_threshold": 0.6,
+    "max_recovery_attempts": 6
+  },
+  "screenshots": {
+    "dir": "data/screenshots",
+    "on_goal_start": true,
+    "on_goal_end": true,
+    "on_failure": true,
+    "full_page": false
+  },
+  "memory": {
+    "enabled": true,
+    "selector_memory_path": "data/learning/memory.sqlite",
+    "site_memory_dir": "data/learning/sites",
+    "max_recoveries_remembered": 50
+  },
+  "ai": {
+    "provider": "groq",
+    "default_planner_model": "qwen/qwen3-32b",
+    "default_reasoning_model": "qwen-qwq-32b",
+    "temperature": 0.2,
+    "max_tokens": 2048,
+    "request_timeout_seconds": 60,
+    "fallback_to_rules": true
+  },
+  "accounts": {
+    "source_file": "config/accounts.json",
+    "state_file": "data/state/accounts.sqlite",
+    "max_attempts": 3,
+    "lease_seconds": 600,
+    "require_password": true,
+    "watch": true,
+    "watch_interval_seconds": 2.0
+  },
+  "logging": {
+    "dir": "data/logs",
+    "level": "INFO",
+    "debug": false
+  },
+  "telegram": {
+    "enabled": true,
+    "live_monitoring": true,
+    "live_update_interval_seconds": 4,
+    "max_message_chunk": 3500
+  },
+  "templates": {
+    "dir": "data/templates"
+  },
+  "dashboard": {
+    "enabled": true
+  },
+  "plugins": {
+    "paths": ["plugins_external"],
+    "enabled": {
+      "heartbeat": true,
+      "metrics": true
+    },
+    "config": {
+      "heartbeat": {"interval": 30}
+    }
+  },
+  "scheduler": {
+    "max_workers": 10
+  },
+  "watchdog": {
+    "interval": 15,
+    "max_recoveries": 5
+  },
+  "config_watch": true,
+  "config_watch_interval": 2.0,
+  "state": {"path": "data/state/state.json"}
+}

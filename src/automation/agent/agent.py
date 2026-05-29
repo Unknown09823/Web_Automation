@@ -84,6 +84,8 @@ class BrowserAgent:
         event_bus: Any = None,
         runs_root: str = "data/runs",
         max_parallel: int = 4,
+        site_memory: Any = None,
+        llm: Any = None,
     ) -> None:
         self.brain = brain
         self.browser = browser
@@ -91,6 +93,11 @@ class BrowserAgent:
         self.event_bus = event_bus
         self.runs_root = runs_root
         self.max_parallel = max_parallel
+        # site_memory: SiteMemory — per-domain self-learning store. Optional.
+        # llm:         LLMBackend — used for fuzzy goal decomposition + the
+        #              supervisor's recovery brainstorming. Optional.
+        self.site_memory = site_memory
+        self.llm = llm
 
         self.waiter = AdaptiveWaiter()
         self.verifier = SuccessVerifier()
@@ -529,6 +536,12 @@ class BrowserAgent:
                 url=url,
                 screenshot_path=screenshot_path,
             ))
+            # Update per-site self-learning memory so future runs against this
+            # domain can pick known-good patterns. Best-effort — never blocks
+            # the agent on a learning-store failure.
+            self._remember_site_success(
+                run, goal, account_id, url, duration_ms,
+            )
             await self._emit(AgentEvent(
                 type=AgentEventType.GOAL_COMPLETED,
                 run_id=run.run_id,
@@ -546,6 +559,9 @@ class BrowserAgent:
                 goal_description=goal_desc,
                 status="failed",
             ))
+            self._remember_site_failure(
+                run, goal, account_id, duration_ms,
+            )
             await self._emit(AgentEvent(
                 type=AgentEventType.GOAL_FAILED,
                 run_id=run.run_id,
@@ -728,6 +744,64 @@ class BrowserAgent:
 
         return verification.passed
 
+    # ---------------------------------------------------------------- learning
+    def _remember_site_success(
+        self,
+        run: RunContext,
+        goal: AgentGoal,
+        account_id: str,
+        url: str,
+        duration_ms: int,
+    ) -> None:
+        """Record a successful goal in the per-site memory store. Optional."""
+        if not self.site_memory:
+            return
+        target_url = (
+            url
+            or goal.params.get("url")
+            or run.metadata.get("target_url", "")
+        )
+        if not target_url:
+            return
+        try:
+            self.site_memory.remember_success(
+                target_url,
+                workflow=goal.type.value,
+                duration_seconds=duration_ms / 1000,
+                # The brain's last_decision exposes resolved selectors which
+                # we can persist as known-good for this site. Best-effort.
+                login_selector=_extract_selector(self.brain, intent="login"),
+                submit_selector=_extract_selector(self.brain, intent="submit"),
+                landing_url=url or None,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("site memory: remember_success failed")
+
+    def _remember_site_failure(
+        self,
+        run: RunContext,
+        goal: AgentGoal,
+        account_id: str,
+        duration_ms: int,
+    ) -> None:
+        if not self.site_memory:
+            return
+        target_url = (
+            goal.params.get("url")
+            or run.metadata.get("target_url", "")
+        )
+        if not target_url:
+            return
+        try:
+            self.site_memory.remember_failure(
+                target_url,
+                workflow=goal.type.value,
+                duration_seconds=duration_ms / 1000,
+                note=(goal.error or "")[:200],
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("site memory: remember_failure failed")
+
     # ---------------------------------------------------------------- events
     async def _emit(self, event: AgentEvent) -> None:
         """Emit an event to the EventBus and append to run log."""
@@ -744,3 +818,28 @@ class BrowserAgent:
                 ))
             except Exception:  # noqa: BLE001
                 log.debug("event publish failed for %s", event.type.value)
+
+
+
+def _extract_selector(brain: Any, *, intent: str) -> str | None:
+    """Pull a known-good selector out of the brain's last decision, if any.
+
+    The :class:`AIBrain` records a ``BrainDecision`` per ``run()`` call, and
+    each ``ActionPlan.steps`` entry has the ``selector`` it actually used.
+    We look for a step whose intent / step name contains the requested
+    intent (e.g. ``login``, ``submit``) and return its selector. Returns
+    ``None`` if the brain hasn't run, or if no matching step is found.
+    """
+    if brain is None:
+        return None
+    decision = getattr(brain, "last_decision", None)
+    if decision is None or decision.plan is None:
+        return None
+    for step in getattr(decision.plan, "steps", []) or []:
+        step_intent = (getattr(step, "intent", "") or "").lower()
+        step_name = (getattr(step, "name", "") or "").lower()
+        if intent in step_intent or intent in step_name:
+            sel = getattr(step, "selector", "")
+            if sel:
+                return str(sel)
+    return None
