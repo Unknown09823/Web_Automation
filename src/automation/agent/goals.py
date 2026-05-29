@@ -28,6 +28,23 @@ class GoalType(str, Enum):
     LOGOUT = "logout"
     CUSTOM = "custom"
 
+    # ----- v2: deterministic-first goals --------------------------------
+    # Each value here is the same string the deterministic engine's
+    # GOAL_SHAPES dict uses, so a goal of these types decomposes into a
+    # single CUSTOM sub-goal whose ``ai_goal`` parameter is just the
+    # value string. That keeps the agent loop unchanged while letting
+    # NL planners and Telegram users address richer concepts directly.
+
+    OPEN_PAGE = "open_page"            # navigate to a named page on the host
+    CLICK_INTENT = "click_intent"      # click any element matching params.intent
+    CUSTOM_STEP = "custom_step"        # explicit alias of CUSTOM, easier to read
+    CLAIM_REWARD = "claim_reward"
+    OPEN_REWARDS_PAGE = "open_rewards_page"
+    OPEN_BETTING_PAGE = "open_betting_page"
+    PLACE_BET = "place_bet"
+    DEPOSIT = "deposit"
+    WITHDRAW = "withdraw"
+
 
 class GoalStatus(str, Enum):
     PENDING = "pending"
@@ -173,6 +190,77 @@ _DECOMPOSITION: dict[GoalType, list[dict[str, Any]]] = {
         {"type": "custom", "description": "Logout from current session",
          "params": {"ai_goal": "logout"},
          "verification_hints": ["logged out", "login page", "signed out"]},
+    ],
+
+    # ------------------------------------------------------- v2 atomic goals
+    # These are *one-step* goals: the deterministic engine's GOAL_SHAPES
+    # already knows how to find and click the right element. Decomposing
+    # them as a single CUSTOM sub-goal keeps the agent loop signature
+    # unchanged while routing the work through the new stack.
+    GoalType.CLAIM_REWARD: [
+        {"type": "custom", "description": "Claim reward / gift / bonus",
+         "params": {"ai_goal": "claim_reward"},
+         "verification_hints": [
+             "claimed", "reward credited", "bonus added", "thank you",
+             "successfully claimed", "added to your account",
+         ]},
+    ],
+    GoalType.OPEN_REWARDS_PAGE: [
+        {"type": "custom", "description": "Open the rewards / promotions page",
+         "params": {"ai_goal": "open_rewards_page"},
+         "verification_hints": [
+             "rewards", "promotions", "bonuses", "offers", "loyalty",
+         ]},
+    ],
+    GoalType.OPEN_BETTING_PAGE: [
+        {"type": "custom", "description": "Open the betting / casino lobby",
+         "params": {"ai_goal": "open_betting_page"},
+         "verification_hints": [
+             "sports", "casino", "lobby", "in-play", "live betting",
+         ]},
+    ],
+    GoalType.PLACE_BET: [
+        {"type": "custom", "description": "Place a bet",
+         "params": {"ai_goal": "place_bet"},
+         "verification_hints": [
+             "bet placed", "bet confirmed", "wager accepted",
+             "thank you for your bet",
+         ]},
+    ],
+    GoalType.DEPOSIT: [
+        {"type": "custom", "description": "Open the deposit flow",
+         "params": {"ai_goal": "deposit"},
+         "verification_hints": [
+             "deposit", "add funds", "amount", "payment method",
+         ]},
+    ],
+    GoalType.WITHDRAW: [
+        {"type": "custom", "description": "Open the withdrawal flow",
+         "params": {"ai_goal": "withdraw"},
+         "verification_hints": [
+             "withdraw", "withdrawal", "cashout", "amount to withdraw",
+         ]},
+    ],
+    # OPEN_PAGE and CLICK_INTENT are configurable atomic goals: the
+    # ``ai_goal`` is taken from goal.params at execution time so the NL
+    # planner can synthesize ad-hoc clicks for unknown buttons.
+    GoalType.OPEN_PAGE: [
+        {"type": "custom",
+         "description": "Open the named page",
+         "params": {},  # ai_goal supplied by the parent goal's params
+         "verification_hints": []},
+    ],
+    GoalType.CLICK_INTENT: [
+        {"type": "custom",
+         "description": "Click element matching the given intent",
+         "params": {},
+         "verification_hints": []},
+    ],
+    GoalType.CUSTOM_STEP: [
+        {"type": "custom",
+         "description": "Custom step",
+         "params": {},
+         "verification_hints": []},
     ],
 }
 

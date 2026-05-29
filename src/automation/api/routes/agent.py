@@ -428,3 +428,110 @@ def _format_plan_reply(plan) -> str:
     lines.append("")
     lines.append("Say **proceed** to execute or provide corrections.")
     return "\n".join(lines)
+
+
+
+# --------------------------------------------------------------- v2 endpoints
+# These four endpoints back the new Telegram control-center buttons
+# (Pause / Resume-Paused / Reasoning / Screenshots) and the dashboard
+# panels that consume the same data via fetch().
+#
+# They are intentionally thin wrappers over BrowserAgent helpers so
+# the request handler stays at the boundary of HTTP concerns:
+#   * 404 only when there is no run by that id
+#   * 409 when the agent rejected the state transition (e.g. resume on
+#     an already-running run is fine, pause on a completed run is not)
+#   * 200 with a minimal JSON envelope on success
+
+
+@router.post("/runs/{run_id}/pause")
+async def pause_run(
+    run_id: str, request: Request, _: str = Depends(auth_required),
+) -> dict:
+    """Pause an active run between goals. Idempotent."""
+    ctx = get_context(request)
+    agent = _get_agent(ctx)
+    ok = await agent.pause(run_id)
+    if not ok:
+        raise HTTPException(404, f"run not active: {run_id}")
+    return {
+        "run_id": run_id,
+        "status": "paused" if agent.is_paused(run_id) else "running",
+    }
+
+
+@router.post("/runs/{run_id}/resume_paused")
+async def resume_paused_run(
+    run_id: str, request: Request, _: str = Depends(auth_required),
+) -> dict:
+    """Lift an in-flight ``/pause``.
+
+    Distinct from ``POST /runs/{id}/resume`` — that one resumes from a
+    checkpoint after a crash. This one simply opens the gate that the
+    pause endpoint closed, with no checkpoint involvement.
+    """
+    ctx = get_context(request)
+    agent = _get_agent(ctx)
+    ok = await agent.resume_paused(run_id)
+    if not ok:
+        raise HTTPException(404, f"run not active: {run_id}")
+    return {
+        "run_id": run_id,
+        "status": "running" if not agent.is_paused(run_id) else "paused",
+    }
+
+
+@router.get("/runs/{run_id}/reasoning/{account_id}")
+async def get_reasoning(
+    run_id: str,
+    account_id: str,
+    request: Request,
+    n: int = 10,
+    _: str = Depends(auth_required),
+) -> dict:
+    """Return the most recent reasoning entries for an account.
+
+    Reads from the on-disk ``reasoning.jsonl`` file when the run is no
+    longer active, so this endpoint works for completed runs too.
+    Newest-first ordering matches the Telegram reasoning panel.
+    """
+    ctx = get_context(request)
+    agent = _get_agent(ctx)
+    # Bounds-check ``n`` so a malicious caller can't DoS by asking for
+    # 10⁹ entries; the on-disk log is capped to 5_000 anyway.
+    n = max(1, min(int(n), 200))
+    entries = agent.reasoning_for(run_id, account_id, n=n)
+    return {
+        "run_id": run_id,
+        "account_id": account_id,
+        "count": len(entries),
+        "entries": entries,
+    }
+
+
+@router.get("/runs/{run_id}/screenshots/{account_id}")
+async def list_screenshots(
+    run_id: str,
+    account_id: str,
+    request: Request,
+    limit: int = 50,
+    _: str = Depends(auth_required),
+) -> dict:
+    """List screenshot file paths for an account, newest first.
+
+    The endpoint deliberately returns *paths*, not bytes. Operators
+    fetch images out-of-band (mounted volume, SCP, or a separate
+    static-file route) — keeping the JSON response small means the
+    Telegram bot can post the list as plain text and the dashboard
+    can preview them lazily.
+    """
+    ctx = get_context(request)
+    agent = _get_agent(ctx)
+    limit = max(1, min(int(limit), 500))
+    paths = agent.screenshots_for(run_id, account_id, limit=limit)
+    return {
+        "run_id": run_id,
+        "account_id": account_id,
+        "count": len(paths),
+        "paths": paths,
+    }
