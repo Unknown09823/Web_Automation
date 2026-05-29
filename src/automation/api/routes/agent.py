@@ -251,6 +251,63 @@ async def stream_events(
     )
 
 
+@router.get("/runs/{run_id}/events_tail")
+async def tail_events(
+    run_id: str,
+    request: Request,
+    cursor: int = 0,
+    limit: int = 200,
+    _: str = Depends(auth_required),
+) -> dict:
+    """Cursor-based pull of run events (the simple, polling alternative to
+    the ``/events`` SSE stream).
+
+    Caller passes the last cursor it received (initially 0); response carries
+    a new cursor and the events between them. Designed for clients without an
+    SSE library — e.g. the Telegram controller's live-watch loop.
+    """
+    ctx = get_context(request)
+    agent = _get_agent(ctx)
+    run_dir = Path(agent.runs_root) / run_id
+    events_file = run_dir / "events.jsonl"
+    status_file = run_dir / "status.json"
+    if not run_dir.exists():
+        # Active runs may exist briefly before the directory is materialized.
+        if run_id not in agent.active_runs:
+            raise HTTPException(404, "run not found")
+
+    events: list[dict[str, Any]] = []
+    new_cursor = cursor
+    if events_file.exists():
+        lines = events_file.read_text().splitlines()
+        new_lines = lines[cursor: cursor + max(1, limit)]
+        for line in new_lines:
+            if not line.strip():
+                continue
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        new_cursor = cursor + len(new_lines)
+
+    status: str | None = None
+    if status_file.exists():
+        try:
+            status = json.loads(status_file.read_text()).get("status")
+        except json.JSONDecodeError:
+            status = None
+    elif run_id in agent.active_runs:
+        status = "running"
+
+    return {
+        "run_id": run_id,
+        "cursor": new_cursor,
+        "events": events,
+        "status": status,
+        "active": run_id in agent.active_runs,
+    }
+
+
 @router.get("/runs/{run_id}/replay/{account_id}")
 async def get_replay(
     run_id: str, account_id: str, request: Request, _: str = Depends(auth_required)
