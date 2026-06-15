@@ -116,6 +116,9 @@ class BrowserAgent:
         template_store_root: str = "data/learning/templates",
         # User-supplied rules JSON file; loaded on top of built-ins.
         rules_path: str | None = None,
+        site_memory: Any = None,
+        llm: Any = None,
+        adaptive_executor: Any = None,
     ) -> None:
         self.brain = brain
         self.browser = browser
@@ -123,6 +126,20 @@ class BrowserAgent:
         self.event_bus = event_bus
         self.runs_root = runs_root
         self.max_parallel = max_parallel
+        # site_memory: SiteMemory — per-domain self-learning store. Optional.
+        # llm:         LLMBackend — used for fuzzy goal decomposition + the
+        #              supervisor's recovery brainstorming. Optional.
+        # adaptive_executor: AdaptiveExecutor — replay-first / AI-fallback
+        #              dispatcher. When set, every goal first tries to
+        #              replay a previously-learned ExecutionTemplate
+        #              before invoking the brain. This is the token-cost
+        #              optimisation that turns "1 LLM call per goal per
+        #              account" into "1 LLM call per goal across N
+        #              accounts". Optional — when None, every goal runs
+        #              through the brain (the original behaviour).
+        self.site_memory = site_memory
+        self.llm = llm
+        self.adaptive = adaptive_executor
 
         self.waiter = AdaptiveWaiter()
         self.verifier = SuccessVerifier()
@@ -642,6 +659,37 @@ class BrowserAgent:
         # Flush recorder
         recorder.flush()
 
+        # Adaptive Execution Mode: if this account succeeded end-to-end and
+        # we have an adaptive executor, distill its successful action ledger
+        # into one or more replayable ExecutionTemplates. This is what
+        # account #2..N will replay deterministically (no LLM calls).
+        if success and self.adaptive is not None:
+            try:
+                target_url = run.metadata.get("target_url", "") or ""
+                inputs_for_template: dict[str, Any] = {}
+                if self.accounts_manager:
+                    account = self.accounts_manager.get(account_id)
+                    if account:
+                        inputs_for_template = {
+                            "username": (
+                                account.username or account.number or account.email
+                            ),
+                            "email":    account.email,
+                            "password": account.password,
+                            "number":   account.number,
+                        }
+                self.adaptive.record_from_run(
+                    recorder.records,
+                    inputs=inputs_for_template,
+                    target_url=target_url,
+                    run_id=run.run_id,
+                    account_id=account_id,
+                )
+            except Exception:  # noqa: BLE001
+                # Recording is best-effort — never fail an account because
+                # we couldn't write a template.
+                log.exception("template recording failed (non-fatal)")
+
         # Save final memory state
         run.save_memory(account_id, {
             "goals_total": len(goals),
@@ -782,6 +830,12 @@ class BrowserAgent:
                 url=url,
                 screenshot_path=screenshot_path,
             ))
+            # Update per-site self-learning memory so future runs against this
+            # domain can pick known-good patterns. Best-effort — never blocks
+            # the agent on a learning-store failure.
+            self._remember_site_success(
+                run, goal, account_id, url, duration_ms,
+            )
             await self._emit(AgentEvent(
                 type=AgentEventType.GOAL_COMPLETED,
                 run_id=run.run_id,
@@ -799,6 +853,9 @@ class BrowserAgent:
                 goal_description=goal_desc,
                 status="failed",
             ))
+            self._remember_site_failure(
+                run, goal, account_id, duration_ms,
+            )
             await self._emit(AgentEvent(
                 type=AgentEventType.GOAL_FAILED,
                 run_id=run.run_id,
@@ -1012,7 +1069,43 @@ class BrowserAgent:
         except Exception:  # noqa: BLE001
             before_url = ""
 
-        if self.brain:
+        # ---------- Adaptive Execution Mode (token optimisation) -----------
+        # Try replay first; brain only runs if no template exists or replay
+        # fails. The first successful account on a domain teaches the
+        # framework via TemplateRecorder; accounts #2..N replay deterministically
+        # (no LLM calls). See agent/adaptive_executor.py for the dispatch logic.
+        used_replay = False
+        if self.adaptive is not None:
+            from automation.agent.adaptive_executor import ExecutionMode
+            adaptive_result = await self.adaptive.execute(
+                page, goal, inputs,
+                target_url=run.metadata.get("target_url", ""),
+                recorder=recorder,
+            )
+            await self._emit(AgentEvent(
+                type=AgentEventType.AI_DECISION,
+                run_id=run.run_id,
+                account_id=account_id,
+                goal=goal_desc,
+                message=adaptive_result.reason or adaptive_result.mode.value,
+                data=adaptive_result.to_dict(),
+            ))
+            if adaptive_result.mode is ExecutionMode.REPLAY_OK:
+                used_replay = True
+            elif adaptive_result.mode is ExecutionMode.REPLAY_FAILED:
+                # Decay event — caller's brain path will now retry. We do
+                # not raise; the brain gets a fresh shot at the goal.
+                await self._emit(AgentEvent(
+                    type=AgentEventType.RECOVERY_STARTED,
+                    run_id=run.run_id,
+                    account_id=account_id,
+                    goal=goal_desc,
+                    message=f"Replay failed: {adaptive_result.reason}",
+                ))
+            # NO_OP / AI_USED both fall through to the brain path.
+
+        # Use AI brain to perceive + plan + act (skipped on REPLAY_OK)
+        if self.brain and not used_replay:
             await self._emit(AgentEvent(
                 type=AgentEventType.AI_DECISION,
                 run_id=run.run_id,
@@ -1098,48 +1191,63 @@ class BrowserAgent:
 
         return verification.passed
 
-    # ---------------------------------------------------------------- inputs
-    def _resolve_inputs(self, account_id: str) -> dict[str, str]:
-        """Look up an account's filled-form inputs (no secrets logged)."""
-        if not self.accounts_manager:
-            return {}
-        account = self.accounts_manager.get(account_id)
-        if not account:
-            return {}
-        return {
-            "username": account.username or account.number or account.email,
-            "email": account.email,
-            "password": account.password,
-            "number": account.number,
-            "phone": account.number,
-        }
-
-    # ---------------------------------------------------------------- pause gate
-    async def _await_unpaused(self, run_id: str) -> None:
-        """Block while the run is paused. No-op when not paused."""
-        ev = self._pause_events.get(run_id)
-        if ev is None or ev.is_set():
+    # ---------------------------------------------------------------- learning
+    def _remember_site_success(
+        self,
+        run: RunContext,
+        goal: AgentGoal,
+        account_id: str,
+        url: str,
+        duration_ms: int,
+    ) -> None:
+        """Record a successful goal in the per-site memory store. Optional."""
+        if not self.site_memory:
             return
-        log.info("run %s paused; waiting for resume", run_id)
-        await ev.wait()
+        target_url = (
+            url
+            or goal.params.get("url")
+            or run.metadata.get("target_url", "")
+        )
+        if not target_url:
+            return
+        try:
+            self.site_memory.remember_success(
+                target_url,
+                workflow=goal.type.value,
+                duration_seconds=duration_ms / 1000,
+                # The brain's last_decision exposes resolved selectors which
+                # we can persist as known-good for this site. Best-effort.
+                login_selector=_extract_selector(self.brain, intent="login"),
+                submit_selector=_extract_selector(self.brain, intent="submit"),
+                landing_url=url or None,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("site memory: remember_success failed")
 
-    def _loop_event_emitter(self, run_id: str):
-        """Adapt the agent's ``_emit`` to the StepLoop ``on_event`` shape."""
-        async def emit(name: str, data: dict[str, Any]) -> None:
-            # Reuse a single AI_DECISION-class event for all loop events
-            # because the existing AgentEventType enum doesn't model
-            # observe/think/act sub-phases — the reasoning log carries
-            # the structured detail. The ``message`` field becomes the
-            # discriminator for downstream readers.
-            await self._emit(AgentEvent(
-                type=AgentEventType.AI_REASONING,
-                run_id=run_id,
-                account_id=str(data.get("account_id") or ""),
-                goal=str(data.get("goal") or ""),
-                message=name,
-                data=data,
-            ))
-        return emit
+    def _remember_site_failure(
+        self,
+        run: RunContext,
+        goal: AgentGoal,
+        account_id: str,
+        duration_ms: int,
+    ) -> None:
+        if not self.site_memory:
+            return
+        target_url = (
+            goal.params.get("url")
+            or run.metadata.get("target_url", "")
+        )
+        if not target_url:
+            return
+        try:
+            self.site_memory.remember_failure(
+                target_url,
+                workflow=goal.type.value,
+                duration_seconds=duration_ms / 1000,
+                note=(goal.error or "")[:200],
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("site memory: remember_failure failed")
 
     # ---------------------------------------------------------------- events
     async def _emit(self, event: AgentEvent) -> None:
@@ -1159,25 +1267,26 @@ class BrowserAgent:
                 log.debug("event publish failed for %s", event.type.value)
 
 
-# ---------------------------------------------------------------- helpers
-def _safe_segment(name: str) -> str:
-    """Sanitize a path segment the same way :class:`RunContext` does.
 
-    Kept module-private so the helper can't drift from the run-folder
-    layout — the agent and the run context must agree byte-for-byte on
-    the account directory name.
+def _extract_selector(brain: Any, *, intent: str) -> str | None:
+    """Pull a known-good selector out of the brain's last decision, if any.
+
+    The :class:`AIBrain` records a ``BrainDecision`` per ``run()`` call, and
+    each ``ActionPlan.steps`` entry has the ``selector`` it actually used.
+    We look for a step whose intent / step name contains the requested
+    intent (e.g. ``login``, ``submit``) and return its selector. Returns
+    ``None`` if the brain hasn't run, or if no matching step is found.
     """
-    return "".join(c if c.isalnum() or c in "-_." else "_" for c in name)[:128]
-
-
-def _host_from_url(url: str) -> str:
-    """Pull the lowercased host out of a URL, tolerant of garbage input."""
-    if not url:
-        return ""
-    if "://" not in url:
-        return url.split("/", 1)[0]
-    from urllib.parse import urlsplit
-    try:
-        return (urlsplit(url).hostname or "").lower()
-    except ValueError:
-        return ""
+    if brain is None:
+        return None
+    decision = getattr(brain, "last_decision", None)
+    if decision is None or decision.plan is None:
+        return None
+    for step in getattr(decision.plan, "steps", []) or []:
+        step_intent = (getattr(step, "intent", "") or "").lower()
+        step_name = (getattr(step, "name", "") or "").lower()
+        if intent in step_intent or intent in step_name:
+            sel = getattr(step, "selector", "")
+            if sel:
+                return str(sel)
+    return None
