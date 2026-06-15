@@ -3,7 +3,8 @@
 Ties together all agent subsystems into a persistent, goal-driven
 execution engine that:
   - Decomposes high-level goals into sub-goals
-  - Executes each sub-goal using the AI brain
+  - Executes each sub-goal using the deterministic-first stack
+    (replay → site memory → heuristics → rules → AI → human handoff)
   - Waits adaptively between steps
   - Recovers from failures using the recovery stack
   - Verifies success using multi-signal verification
@@ -11,7 +12,11 @@ execution engine that:
   - Checkpoints progress for resume capability
   - Emits events for live dashboard observation
 
-Each account gets its own isolated browser session and execution context.
+Each account gets its own isolated browser session, its own
+:class:`ReasoningLog`, its own :class:`StepLoop`, and a private
+view onto the shared :class:`DeterministicEngine`. The engine's
+caches (templates, site memory) are deliberately shared so account
+#2 benefits from what account #1 learned.
 """
 from __future__ import annotations
 
@@ -19,9 +24,11 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from automation.agent.checkpoints import Checkpoint, CheckpointManager
+from automation.agent.deterministic_engine import DeterministicEngine
 from automation.agent.events import AgentEvent, AgentEventType
 from automation.agent.goals import (
     AgentGoal,
@@ -29,9 +36,16 @@ from automation.agent.goals import (
     GoalStatus,
     GoalType,
 )
+from automation.agent.heuristics import Heuristics
+from automation.agent.loop import StepLoop, StepLoopResult
+from automation.agent.popup_guard import PopupGuard
+from automation.agent.reasoning import ReasoningLog
 from automation.agent.recorder import ActionRecorder
 from automation.agent.recovery import RecoveryStack
+from automation.agent.rule_engine import RuleEngine
 from automation.agent.run import RunContext, RunStatus
+from automation.agent.site_memory import SiteMemory
+from automation.agent.site_templates import TemplateStore
 from automation.agent.verifier import SuccessVerifier
 from automation.agent.waiter import AdaptiveWaiter
 
@@ -84,6 +98,24 @@ class BrowserAgent:
         event_bus: Any = None,
         runs_root: str = "data/runs",
         max_parallel: int = 4,
+        # ----- v2 deterministic-first stack ---------------------------
+        # Pass any subset of these in to override the defaults. When a
+        # component is None and ``deterministic_first`` is True the
+        # agent constructs a sensible default itself, so the call site
+        # only needs to opt out by setting ``deterministic_first=False``
+        # to get the legacy brain-driven flow.
+        deterministic_first: bool = True,
+        site_memory: SiteMemory | None = None,
+        template_store: TemplateStore | None = None,
+        popup_guard: PopupGuard | None = None,
+        rule_engine: RuleEngine | None = None,
+        heuristics: Heuristics | None = None,
+        deterministic_engine: DeterministicEngine | None = None,
+        # Path roots for the new stores; defaults under data/learning/.
+        site_memory_root: str = "data/learning/sites",
+        template_store_root: str = "data/learning/templates",
+        # User-supplied rules JSON file; loaded on top of built-ins.
+        rules_path: str | None = None,
         site_memory: Any = None,
         llm: Any = None,
         adaptive_executor: Any = None,
@@ -114,8 +146,96 @@ class BrowserAgent:
         self.decomposer = GoalDecomposer()
         self.recovery = RecoveryStack(brain=brain)
 
+        # ----- deterministic-first stack -------------------------------
+        # All four stores are best-instantiated lazily so test harnesses
+        # don't pay the cost when they don't use the agent. The flag
+        # ``self.deterministic_first`` ultimately decides whether
+        # ``_attempt_goal`` routes a non-navigate goal through the
+        # StepLoop (engine-driven) or through the legacy brain.run flow.
+        self.deterministic_first = bool(deterministic_first)
+        self.site_memory: SiteMemory | None = site_memory
+        self.template_store: TemplateStore | None = template_store
+        self.popup_guard: PopupGuard | None = popup_guard
+        self.rule_engine: RuleEngine | None = rule_engine
+        self.heuristics: Heuristics | None = heuristics
+        self.deterministic_engine: DeterministicEngine | None = deterministic_engine
+
+        if self.deterministic_first:
+            if self.site_memory is None:
+                self.site_memory = SiteMemory(root=site_memory_root)
+            if self.template_store is None:
+                self.template_store = TemplateStore(root=template_store_root)
+            if self.popup_guard is None:
+                self.popup_guard = PopupGuard()
+            if self.rule_engine is None:
+                self.rule_engine = RuleEngine()
+                if rules_path:
+                    try:
+                        self.rule_engine.load(rules_path)
+                    except Exception:  # noqa: BLE001
+                        log.warning(
+                            "agent: failed to load rules from %s", rules_path,
+                            exc_info=True,
+                        )
+            if self.heuristics is None:
+                self.heuristics = Heuristics()
+            if self.deterministic_engine is None:
+                self.deterministic_engine = DeterministicEngine(
+                    rules=self.rule_engine,
+                    heuristics=self.heuristics,
+                    site_memory=self.site_memory,
+                    templates=self.template_store,
+                    brain=self.brain,
+                )
+
+        # Form filler — always available regardless of deterministic_first.
+        # The executor will use it for all FILL actions when present.
+        from automation.agent.form_filler import FormFiller
+        self.form_filler = FormFiller()
+
+        # Obstruction detector — applied to every CLICK that goes
+        # through the executor when present. We share the agent's
+        # PopupGuard so the detector's "ask the popup engine to
+        # dismiss the blocker" path uses the same rule catalog the
+        # observer ran in the loop's pre-think phase. This makes the
+        # error-recovery story symmetric: whatever the popup_guard
+        # would have dismissed up front, it can still dismiss
+        # mid-step when an overlay sneaks in.
+        from automation.agent.obstruction import ObstructionDetector
+        self.obstruction_detector = ObstructionDetector(
+            popup_guard=self.popup_guard,
+        )
+
+        # Form engine — orchestrator over Heuristics + FormFiller. Not
+        # currently invoked by the loop directly; exposed on the agent
+        # so plugins / workflows that want a one-shot
+        # "discover-and-fill-everything" call have a high-level API
+        # without re-deriving classification rules per caller.
+        from automation.agent.form_engine import FormEngine
+        self.form_engine = FormEngine(
+            heuristics=self.heuristics,
+            form_filler=self.form_filler,
+        )
+
+        # Captcha handler — available for the loop's recovery path.
+        from automation.agent.captcha_handler import CaptchaHandler
+        self.captcha_handler = CaptchaHandler()
+
+        # AI cost tracker — shared across all accounts and runs.
+        from automation.agent.cost_tracker import CostTracker
+        self.cost_tracker = CostTracker(
+            persist_path=Path("data/state/cost_tracker.json"),
+        )
+        self.cost_tracker.load()  # restore from disk if available
+
         self._active_runs: dict[str, RunContext] = {}
         self._cancelled: set[str] = set()
+        # Pause/resume per run. Event is *set* when running, cleared when
+        # paused — _run_account awaits between goals via _await_unpaused.
+        self._pause_events: dict[str, asyncio.Event] = {}
+        # Per-account reasoning logs, used by the loop *and* exposed to
+        # external readers (Telegram bot, API) via ``reasoning_for``.
+        self._reasoning_logs: dict[tuple[str, str], ReasoningLog] = {}
 
 
     # ---------------------------------------------------------------- public API
@@ -249,8 +369,103 @@ class BrowserAgent:
         """Cancel a running agent execution."""
         if run_id in self._active_runs:
             self._cancelled.add(run_id)
+            # Unpause so the per-account loop can observe the cancel
+            # and exit promptly rather than waiting on a stale gate.
+            ev = self._pause_events.get(run_id)
+            if ev is not None and not ev.is_set():
+                ev.set()
             return True
         return False
+
+    async def pause(self, run_id: str) -> bool:
+        """Pause an active run between goals.
+
+        Pausing does not interrupt a goal that is already executing —
+        the loop checks the gate *between* goals so that mid-form-fill
+        state never gets stranded. Returns ``True`` if the run is now
+        paused, ``False`` if no such run is active.
+        """
+        if run_id not in self._active_runs:
+            return False
+        ev = self._pause_events.get(run_id)
+        if ev is None:
+            ev = asyncio.Event()
+            ev.set()  # default: running
+            self._pause_events[run_id] = ev
+        if ev.is_set():
+            ev.clear()
+        await self._emit(AgentEvent(
+            type=AgentEventType.WAITING,
+            run_id=run_id,
+            message="run paused (gate cleared)",
+        ))
+        return True
+
+    async def resume_paused(self, run_id: str) -> bool:
+        """Lift a pause on an active run.
+
+        Distinct from :py:meth:`resume_run`, which restarts a previously
+        terminated run from a checkpoint. ``resume_paused`` simply opens
+        the gate that ``pause`` closed.
+        """
+        if run_id not in self._active_runs:
+            return False
+        ev = self._pause_events.get(run_id)
+        if ev is None or ev.is_set():
+            return True
+        ev.set()
+        await self._emit(AgentEvent(
+            type=AgentEventType.RUN_RESUMED,
+            run_id=run_id,
+            message="run resumed (gate opened)",
+        ))
+        return True
+
+    def is_paused(self, run_id: str) -> bool:
+        ev = self._pause_events.get(run_id)
+        return ev is not None and not ev.is_set()
+
+    # ---------------------------------------------------------- read-only
+    def reasoning_for(
+        self, run_id: str, account_id: str, *, n: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Return the most recent ``n`` reasoning entries for an account.
+
+        Entries are returned newest-first. Reads from the on-disk log
+        when there's no in-memory handle (e.g. for a completed run).
+        """
+        log_obj = self._reasoning_logs.get((run_id, account_id))
+        if log_obj is None:
+            path = (
+                Path(self.runs_root)
+                / run_id
+                / _safe_segment(account_id)
+                / "reasoning.jsonl"
+            )
+            log_obj = ReasoningLog(path)
+        try:
+            entries = log_obj.tail(n=n)
+        except Exception:  # noqa: BLE001
+            return []
+        return [e.to_dict() for e in entries]
+
+    def screenshots_for(
+        self, run_id: str, account_id: str, *, limit: int = 50,
+    ) -> list[str]:
+        """Return paths of saved screenshots for an account, newest first."""
+        d = (
+            Path(self.runs_root)
+            / run_id
+            / _safe_segment(account_id)
+            / "screenshots"
+        )
+        if not d.exists():
+            return []
+        files = sorted(
+            (str(p) for p in d.iterdir() if p.is_file()),
+            reverse=True,
+        )
+        return files[:limit]
 
     async def resume_run(self, run_dir: str) -> RunContext:
         """Resume a previously interrupted run from its last checkpoint."""
@@ -371,10 +586,37 @@ class BrowserAgent:
             session = await self.browser.get_or_create(account_id, overrides=overrides)
             page = session.page
 
-        # Set up per-account recorder and checkpoint manager
+        # Set up per-account recorder, checkpoint manager, and reasoning log.
+        # The reasoning log is registered on the agent so external readers
+        # (Telegram bot, API) can tail it without re-parsing the file on
+        # every poll.
         account_dir = run.account_dir(account_id)
         recorder = ActionRecorder(account_dir / "replay.json")
         checkpoints = CheckpointManager(run.base_dir)
+        reasoning_log = ReasoningLog(account_dir / "reasoning.jsonl")
+        self._reasoning_logs[(run.run_id, account_id)] = reasoning_log
+
+        # Build a fresh StepLoop per account so the reasoning_log is
+        # bound to the right destination. Components that *can* be
+        # shared across accounts (engine, popup_guard) are reused;
+        # everything per-account lives on the loop instance.
+        step_loop: StepLoop | None = None
+        if self.deterministic_first and self.deterministic_engine is not None:
+            from automation.ai.executor import ActionExecutor
+            executor = ActionExecutor(
+                screenshot_dir=account_dir / "screenshots",
+                form_filler=self.form_filler,
+                obstruction_detector=self.obstruction_detector,
+            )
+            step_loop = StepLoop(
+                popup_guard=self.popup_guard,
+                deterministic_engine=self.deterministic_engine,
+                executor=executor,
+                verifier=self.verifier,
+                waiter=self.waiter,
+                reasoning_log=reasoning_log,
+                on_event=self._loop_event_emitter(run.run_id),
+            )
 
         # Determine start index (for resume)
         start_index = 0
@@ -393,6 +635,11 @@ class BrowserAgent:
             if i < start_index:
                 continue
 
+            # Pause gate: between every goal we honour ``pause()``.
+            await self._await_unpaused(run.run_id)
+            if run.run_id in self._cancelled:
+                break
+
             goal_success = await self._execute_goal(
                 run=run,
                 page=page,
@@ -402,6 +649,7 @@ class BrowserAgent:
                 goal_index=i,
                 recorder=recorder,
                 checkpoints=checkpoints,
+                step_loop=step_loop,
             )
 
             if not goal_success:
@@ -467,6 +715,9 @@ class BrowserAgent:
             message=f"Account {account_id} {'completed' if success else 'failed'}",
         ))
 
+        # Persist cost tracker after each account completes
+        self.cost_tracker.flush()
+
 
     # ---------------------------------------------------------------- per-goal
     async def _execute_goal(
@@ -480,6 +731,7 @@ class BrowserAgent:
         goal_index: int,
         recorder: ActionRecorder,
         checkpoints: CheckpointManager,
+        step_loop: StepLoop | None = None,
     ) -> bool:
         """Execute a single goal with waiting, recovery, and verification."""
         goal.status = GoalStatus.RUNNING
@@ -508,7 +760,8 @@ class BrowserAgent:
             try:
                 success = await self._attempt_goal(
                     run=run, page=page, account_id=account_id,
-                    goal=goal, recorder=recorder,
+                    goal=goal, goal_index=goal_index,
+                    recorder=recorder, step_loop=step_loop,
                 )
             except Exception as exc:  # noqa: BLE001
                 attempt_error = repr(exc)
@@ -622,7 +875,9 @@ class BrowserAgent:
         page: Any,
         account_id: str,
         goal: AgentGoal,
+        goal_index: int = 0,
         recorder: ActionRecorder,
+        step_loop: StepLoop | None = None,
     ) -> bool:
         """Single attempt at executing a goal."""
         if page is None:
@@ -674,29 +929,145 @@ class BrowserAgent:
             )
             return verification.passed
 
-        # Step 2: AI-driven goal execution
+        # ---------- non-navigate goal -----------------------------------
+        # Take a pre-action screenshot. The path is also returned so the
+        # reasoning panel / replay tools can find it without scanning.
         ai_goal = goal.params.get("ai_goal", goal.type.value)
+        await run.save_screenshot(page, account_id, f"before_{ai_goal}")
 
-        # Get account data for form filling
-        inputs: dict[str, str] = {}
-        if self.accounts_manager:
-            account = self.accounts_manager.get(account_id)
-            if account:
-                inputs = {
-                    "username": account.username or account.number or account.email,
-                    "email": account.email,
-                    "password": account.password,
-                    "number": account.number,
-                }
+        # Resolve per-account inputs once, both paths use the same dict.
+        inputs = self._resolve_inputs(account_id)
 
-        # Capture before-URL for verification (defensive: page may be closed)
+        if step_loop is not None:
+            # ---- v2 deterministic-first path ---------------------------
+            return await self._attempt_via_loop(
+                run=run, page=page, account_id=account_id,
+                goal=goal, goal_index=goal_index,
+                ai_goal=ai_goal, inputs=inputs,
+                recorder=recorder, step_loop=step_loop,
+            )
+
+        # ---- legacy brain-driven path ----------------------------------
+        return await self._attempt_via_brain(
+            run=run, page=page, account_id=account_id,
+            goal=goal, ai_goal=ai_goal, inputs=inputs,
+            recorder=recorder,
+        )
+
+    # ---------------------------------------------------------------- v2 attempt
+    async def _attempt_via_loop(
+        self,
+        *,
+        run: RunContext,
+        page: Any,
+        account_id: str,
+        goal: AgentGoal,
+        goal_index: int,
+        ai_goal: str,
+        inputs: dict[str, str],
+        recorder: ActionRecorder,
+        step_loop: StepLoop,
+    ) -> bool:
+        """Execute one non-navigate goal via the deterministic StepLoop.
+
+        Translates the loop's :class:`StepLoopResult` into the agent's
+        bool / event protocol so the rest of ``_execute_goal`` is
+        agnostic to which path produced the result.
+        """
+        goal_desc = goal.description or goal.type.value
         try:
             before_url = page.url
         except Exception:  # noqa: BLE001
             before_url = ""
+        host = _host_from_url(before_url)
 
-        # Take pre-action screenshot
-        await run.save_screenshot(page, account_id, f"before_{ai_goal}")
+        result: StepLoopResult = await step_loop.execute_goal(
+            page=page,
+            run_id=run.run_id,
+            account_id=account_id,
+            goal_name=ai_goal,
+            goal_description=goal_desc,
+            goal_index=goal_index,
+            inputs=inputs,
+            verification_hints=goal.verification_hints,
+            before_url=before_url,
+            host=host,
+            cancel_check=lambda: run.run_id in self._cancelled,
+        )
+
+        # Mirror the loop's plan + action summary into the legacy
+        # recorder so existing replay.json consumers still see what
+        # happened.
+        recorder.record_ai_decision(
+            ai_goal,
+            result.plan.to_dict(),
+            confidence=result.plan.confidence,
+        )
+
+        # Track AI cost based on which level resolved the goal
+        from automation.agent.reasoning import DecisionSource
+        source = result.plan.source
+        if source is DecisionSource.AI:
+            self.cost_tracker.record_ai_call(goal=ai_goal)
+        elif source is DecisionSource.REPLAY:
+            self.cost_tracker.record_template_replay(goal=ai_goal)
+        elif source is DecisionSource.HEURISTIC:
+            self.cost_tracker.record_heuristic_hit(goal=ai_goal)
+        elif source is DecisionSource.SITE_MEMORY:
+            self.cost_tracker.record_site_memory_hit(goal=ai_goal)
+        elif source is DecisionSource.RULE:
+            self.cost_tracker.record_rule_hit(goal=ai_goal)
+        elif source is DecisionSource.HUMAN:
+            self.cost_tracker.record_human_handoff(goal=ai_goal)
+        if result.popup_result and result.popup_result.any_dismissed:
+            recorder.record_wait(
+                "popup_dismiss", True, result.popup_result.duration_ms,
+            )
+
+        # Emit a verification-style event so the dashboard / Telegram
+        # bot keeps the same lifecycle it had on the legacy path.
+        await self._emit(AgentEvent(
+            type=(
+                AgentEventType.VERIFICATION_PASSED
+                if result.success
+                else AgentEventType.VERIFICATION_FAILED
+            ),
+            run_id=run.run_id,
+            account_id=account_id,
+            goal=goal_desc,
+            confidence=(
+                result.verification.confidence if result.verification else 0.0
+            ),
+            message=(
+                result.verification.reason if result.verification
+                else (result.error or result.plan.rationale)
+            ),
+            data={"source": result.plan.source.value},
+        ))
+
+        await run.save_screenshot(page, account_id, f"after_{ai_goal}")
+        return result.success
+
+    # ---------------------------------------------------------------- legacy attempt
+    async def _attempt_via_brain(
+        self,
+        *,
+        run: RunContext,
+        page: Any,
+        account_id: str,
+        goal: AgentGoal,
+        ai_goal: str,
+        inputs: dict[str, str],
+        recorder: ActionRecorder,
+    ) -> bool:
+        """Original brain-only path. Preserved for ``deterministic_first=False``
+        and as the safety net when ``deterministic_engine`` is unavailable.
+        """
+        goal_desc = goal.description or goal.type.value
+        try:
+            before_url = page.url
+        except Exception:  # noqa: BLE001
+            before_url = ""
 
         # ---------- Adaptive Execution Mode (token optimisation) -----------
         # Try replay first; brain only runs if no template exists or replay

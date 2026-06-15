@@ -165,6 +165,24 @@ async def _run_server(
             browser=browser,
             accounts_manager=accounts,
             event_bus=engine.event_bus,
+            runs_root=config.get("agent.runs_root", "data/runs"),
+            max_parallel=int(config.get("agent.max_parallel", 4)),
+            # ----- v2 deterministic-first stack ---------------------
+            # Each of these can be flipped off independently. The
+            # constructor only builds a component when the master
+            # ``deterministic_first`` flag is true; setting it to
+            # ``false`` here skips the entire new pipeline and
+            # restores the legacy brain.run flow.
+            deterministic_first=bool(
+                config.get("agent.deterministic_first", True),
+            ),
+            site_memory_root=config.get(
+                "agent.site_memory_root", "data/learning/sites",
+            ),
+            template_store_root=config.get(
+                "agent.template_store_root", "data/learning/templates",
+            ),
+            rules_path=config.get("agent.rules_path"),
             runs_root=settings.get("runs.path", "data/runs"),
             max_parallel=int(settings.get("execution.max_parallel_workers", 5)),
             site_memory=site_memory,

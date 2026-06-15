@@ -1,3 +1,26 @@
+
+* **Pages** — URL paths the agent has seen, with the symbolic name
+  it learned for each (``/promo/rewards`` → ``"rewards"``).
+* **Buttons** — selector candidates per intent group, ranked by
+  success / fail counters. The deterministic engine consults this
+  list before falling back to heuristic detection.
+* **Navigation paths** — how to get from one page to another (e.g.
+  from ``"dashboard"`` to ``"rewards"``: click selector ``.menu-rewards``).
+  This lets the agent cross-navigate without re-running heuristics.
+* **Success signals** — URL fragments, body phrases, or visible
+  elements that historically meant a goal completed. The verifier
+  uses these as additional weighted signals.
+
+Persistence model
+
+Writes are debounced via :py:meth:`flush` — a busy run can mutate
+state hundreds of times, but we only hit the disk on flush. Reads
+are always served from the in-memory cache so the hot path never
+blocks on I/O. Operators can call :py:meth:`flush_all` or pass
+``autoflush=True`` for stricter guarantees.
+
+The format is intentionally permissive: unknown top-level keys are
+preserved on round-trip so users can attach private annotations.
 """Per-site self-learning memory.
 
 Each site gets a JSON file under ``data/learning/sites/<domain>.json``

@@ -28,6 +28,41 @@ class GoalType(str, Enum):
     LOGOUT = "logout"
     CUSTOM = "custom"
 
+    # ----- v2: deterministic-first goals --------------------------------
+    # Each value here is the same string the deterministic engine's
+    # GOAL_SHAPES dict uses, so a goal of these types decomposes into a
+    # single CUSTOM sub-goal whose ``ai_goal`` parameter is just the
+    # value string. That keeps the agent loop unchanged while letting
+    # NL planners and Telegram users address richer concepts directly.
+
+    OPEN_PAGE = "open_page"            # navigate to a named page on the host
+    CLICK_INTENT = "click_intent"      # click any element matching params.intent
+    CUSTOM_STEP = "custom_step"        # explicit alias of CUSTOM, easier to read
+    CLAIM_REWARD = "claim_reward"
+    OPEN_REWARDS_PAGE = "open_rewards_page"
+    OPEN_BETTING_PAGE = "open_betting_page"
+    PLACE_BET = "place_bet"
+    DEPOSIT = "deposit"
+    WITHDRAW = "withdraw"
+
+    # ----- v3: arbitrary task goals ------------------------------------
+    OPEN_WALLET = "open_wallet"
+    COMPLETE_PROFILE = "complete_profile"
+    JOIN_PROMOTION = "join_promotion"
+    DOWNLOAD_REPORT = "download_report"
+    UPLOAD_DOCUMENT = "upload_document"
+    SUBMIT_FORM = "submit_form"
+    OPEN_DASHBOARD = "open_dashboard"
+    NAVIGATE_TO = "navigate_to"        # navigate to a URL from params
+    ACCEPT_TERMS = "accept_terms"
+    COMPLETE_KYC = "complete_kyc"
+    REFER_FRIEND = "refer_friend"
+    CHECK_BALANCE = "check_balance"
+    TRANSFER_FUNDS = "transfer_funds"
+    CHANGE_PASSWORD = "change_password"
+    ENABLE_2FA = "enable_2fa"
+    CONTACT_SUPPORT = "contact_support"
+
 
 class GoalStatus(str, Enum):
     PENDING = "pending"
@@ -173,6 +208,213 @@ _DECOMPOSITION: dict[GoalType, list[dict[str, Any]]] = {
         {"type": "custom", "description": "Logout from current session",
          "params": {"ai_goal": "logout"},
          "verification_hints": ["logged out", "login page", "signed out"]},
+    ],
+
+    # ------------------------------------------------------- v2 atomic goals
+    # These are *one-step* goals: the deterministic engine's GOAL_SHAPES
+    # already knows how to find and click the right element. Decomposing
+    # them as a single CUSTOM sub-goal keeps the agent loop signature
+    # unchanged while routing the work through the new stack.
+    GoalType.CLAIM_REWARD: [
+        {"type": "custom", "description": "Claim reward / gift / bonus",
+         "params": {"ai_goal": "claim_reward"},
+         "verification_hints": [
+             "claimed", "reward credited", "bonus added", "thank you",
+             "successfully claimed", "added to your account",
+         ]},
+    ],
+    GoalType.OPEN_REWARDS_PAGE: [
+        {"type": "custom", "description": "Open the rewards / promotions page",
+         "params": {"ai_goal": "open_rewards_page"},
+         "verification_hints": [
+             "rewards", "promotions", "bonuses", "offers", "loyalty",
+         ]},
+    ],
+    GoalType.OPEN_BETTING_PAGE: [
+        {"type": "custom", "description": "Open the betting / casino lobby",
+         "params": {"ai_goal": "open_betting_page"},
+         "verification_hints": [
+             "sports", "casino", "lobby", "in-play", "live betting",
+         ]},
+    ],
+    GoalType.PLACE_BET: [
+        {"type": "custom", "description": "Place a bet",
+         "params": {"ai_goal": "place_bet"},
+         "verification_hints": [
+             "bet placed", "bet confirmed", "wager accepted",
+             "thank you for your bet",
+         ]},
+    ],
+    GoalType.DEPOSIT: [
+        {"type": "custom", "description": "Open the deposit flow",
+         "params": {"ai_goal": "deposit"},
+         "verification_hints": [
+             "deposit", "add funds", "amount", "payment method",
+         ]},
+    ],
+    GoalType.WITHDRAW: [
+        {"type": "custom", "description": "Open the withdrawal flow",
+         "params": {"ai_goal": "withdraw"},
+         "verification_hints": [
+             "withdraw", "withdrawal", "cashout", "amount to withdraw",
+         ]},
+    ],
+    # OPEN_PAGE and CLICK_INTENT are configurable atomic goals: the
+    # ``ai_goal`` is taken from goal.params at execution time so the NL
+    # planner can synthesize ad-hoc clicks for unknown buttons.
+    GoalType.OPEN_PAGE: [
+        {"type": "custom",
+         "description": "Open the named page",
+         "params": {},  # ai_goal supplied by the parent goal's params
+         "verification_hints": []},
+    ],
+    GoalType.CLICK_INTENT: [
+        {"type": "custom",
+         "description": "Click element matching the given intent",
+         "params": {},
+         "verification_hints": []},
+    ],
+    GoalType.CUSTOM_STEP: [
+        {"type": "custom",
+         "description": "Custom step",
+         "params": {},
+         "verification_hints": []},
+    ],
+
+    # ------------------------------------------------------- v3 arbitrary tasks
+    GoalType.OPEN_WALLET: [
+        {"type": "custom", "description": "Open the wallet / balance page",
+         "params": {"ai_goal": "open_wallet"},
+         "verification_hints": [
+             "wallet", "balance", "funds", "my wallet", "account balance",
+         ]},
+    ],
+    GoalType.COMPLETE_PROFILE: [
+        {"type": "custom", "description": "Navigate to profile settings",
+         "params": {"ai_goal": "open_profile"},
+         "verification_hints": ["profile", "settings", "my account"]},
+        {"type": "custom", "description": "Fill profile form fields",
+         "params": {"ai_goal": "fill_form"},
+         "verification_hints": ["fields filled", "form populated"]},
+        {"type": "custom", "description": "Submit / save profile",
+         "params": {"ai_goal": "submit"},
+         "verification_hints": [
+             "saved", "updated", "profile complete", "success",
+         ]},
+    ],
+    GoalType.JOIN_PROMOTION: [
+        {"type": "custom", "description": "Navigate to promotions page",
+         "params": {"ai_goal": "open_rewards_page"},
+         "verification_hints": ["promotions", "offers", "promo"]},
+        {"type": "custom", "description": "Join / opt-in to the promotion",
+         "params": {"ai_goal": "join_promotion"},
+         "verification_hints": [
+             "joined", "opted in", "enrolled", "activated",
+             "promotion activated", "success",
+         ]},
+    ],
+    GoalType.DOWNLOAD_REPORT: [
+        {"type": "custom", "description": "Navigate to reports section",
+         "params": {"ai_goal": "open_reports"},
+         "verification_hints": ["reports", "download", "export"]},
+        {"type": "custom", "description": "Initiate report download",
+         "params": {"ai_goal": "download"},
+         "verification_hints": ["download started", "generating"]},
+        {"type": "custom", "description": "Wait for download to complete",
+         "params": {"wait_for": "download_complete"},
+         "verification_hints": ["downloaded", "complete"]},
+    ],
+    GoalType.UPLOAD_DOCUMENT: [
+        {"type": "custom", "description": "Navigate to document upload section",
+         "params": {"ai_goal": "open_upload"},
+         "verification_hints": ["upload", "documents", "files", "attach"]},
+        {"type": "custom", "description": "Upload the document",
+         "params": {"ai_goal": "upload"},
+         "verification_hints": [
+             "uploaded", "attached", "file received", "success",
+         ]},
+    ],
+    GoalType.SUBMIT_FORM: [
+        {"type": "custom", "description": "Fill form fields",
+         "params": {"ai_goal": "fill_form"},
+         "verification_hints": ["fields filled"]},
+        {"type": "custom", "description": "Submit the form",
+         "params": {"ai_goal": "submit"},
+         "verification_hints": [
+             "submitted", "success", "thank you", "received",
+         ]},
+    ],
+    GoalType.OPEN_DASHBOARD: [
+        {"type": "custom", "description": "Navigate to the main dashboard",
+         "params": {"ai_goal": "open_dashboard"},
+         "verification_hints": [
+             "dashboard", "home", "overview", "welcome",
+         ]},
+    ],
+    GoalType.NAVIGATE_TO: [
+        {"type": "navigate", "description": "Navigate to URL",
+         "params": {},  # url from parent goal.params
+         "verification_hints": ["page loaded"]},
+    ],
+    GoalType.ACCEPT_TERMS: [
+        {"type": "custom", "description": "Accept terms and conditions",
+         "params": {"ai_goal": "accept_terms"},
+         "verification_hints": [
+             "accepted", "agreed", "terms accepted", "continue",
+         ]},
+    ],
+    GoalType.COMPLETE_KYC: [
+        {"type": "custom", "description": "Navigate to KYC / verification section",
+         "params": {"ai_goal": "open_kyc"},
+         "verification_hints": ["verification", "kyc", "identity"]},
+        {"type": "custom", "description": "Complete identity verification",
+         "params": {"ai_goal": "fill_form"},
+         "verification_hints": ["submitted", "under review", "verified"]},
+    ],
+    GoalType.REFER_FRIEND: [
+        {"type": "custom", "description": "Open referral page",
+         "params": {"ai_goal": "open_referral"},
+         "verification_hints": ["referral", "invite", "refer"]},
+        {"type": "custom", "description": "Complete referral action",
+         "params": {"ai_goal": "submit"},
+         "verification_hints": ["invited", "sent", "referral sent", "link copied"]},
+    ],
+    GoalType.CHECK_BALANCE: [
+        {"type": "custom", "description": "Check account balance",
+         "params": {"ai_goal": "open_wallet"},
+         "verification_hints": ["balance", "funds", "wallet", "amount"]},
+    ],
+    GoalType.TRANSFER_FUNDS: [
+        {"type": "custom", "description": "Open transfer / send page",
+         "params": {"ai_goal": "open_transfer"},
+         "verification_hints": ["transfer", "send", "pay"]},
+        {"type": "custom", "description": "Fill transfer details and submit",
+         "params": {"ai_goal": "fill_form"},
+         "verification_hints": ["sent", "transferred", "success"]},
+    ],
+    GoalType.CHANGE_PASSWORD: [
+        {"type": "custom", "description": "Navigate to password change",
+         "params": {"ai_goal": "open_profile"},
+         "verification_hints": ["password", "security", "change password"]},
+        {"type": "custom", "description": "Fill and submit new password",
+         "params": {"ai_goal": "change_password"},
+         "verification_hints": ["password changed", "updated", "success"]},
+    ],
+    GoalType.ENABLE_2FA: [
+        {"type": "custom", "description": "Navigate to 2FA / security settings",
+         "params": {"ai_goal": "open_security"},
+         "verification_hints": ["two-factor", "2fa", "security", "authenticator"]},
+        {"type": "custom", "description": "Enable 2FA",
+         "params": {"ai_goal": "enable_2fa"},
+         "verification_hints": ["enabled", "activated", "configured"]},
+    ],
+    GoalType.CONTACT_SUPPORT: [
+        {"type": "custom", "description": "Open support / help page",
+         "params": {"ai_goal": "open_support"},
+         "verification_hints": ["support", "help", "contact", "chat"]},
+        {"type": "custom", "description": "Submit support message",
+         "params": {"ai_goal": "submit"},
+         "verification_hints": ["sent", "ticket created", "we'll get back"]},
     ],
 }
 

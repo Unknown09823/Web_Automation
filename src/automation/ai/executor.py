@@ -58,16 +58,36 @@ class PlanResult:
 
 
 class ActionExecutor:
-    """Drive a Playwright ``Page`` through an ``ActionPlan``."""
+    """Drive a Playwright ``Page`` through an ``ActionPlan``.
+
+    When a :class:`~automation.agent.form_filler.FormFiller` is provided,
+    all FILL actions use the multi-strategy engine with post-fill
+    verification and automatic retry. Otherwise falls back to the
+    simple ``page.fill()`` path for backwards compatibility.
+
+    When an :class:`~automation.agent.obstruction.ObstructionDetector`
+    is provided, every CLICK action goes through the detector's
+    ``safe_click`` (probe → unblock if needed → click). This catches
+    the cookie-banner / sticky-header cases that otherwise produce
+    silent zero-effect clicks. The detector is optional; without one
+    the executor uses a plain ``page.click()`` and the rest of the
+    framework behaves exactly as before.
+    """
 
     def __init__(
         self,
         screenshot_dir: str | Path = "data/screenshots",
         dry_run: bool = False,
+        form_filler: Any = None,
+        obstruction_detector: Any = None,
     ) -> None:
         self.screenshot_dir = Path(screenshot_dir)
         self.screenshot_dir.mkdir(parents=True, exist_ok=True)
         self.dry_run = dry_run
+        self.form_filler = form_filler
+        self.obstruction_detector = obstruction_detector
+        # Track filled fields for pre-submit validation
+        self._filled_fields: list[tuple[str, str]] = []
 
     async def execute(self, page: Any, plan: ActionPlan) -> PlanResult:
         result = PlanResult(plan=plan)
@@ -150,7 +170,88 @@ class ActionExecutor:
 
     # ----------------------------------------------------------- step helpers
     async def _click(self, page: Any, step: ActionStep) -> None:
+        # Pre-submit validation: if this click is a submit and we have
+        # a form_filler + previously filled fields, validate them all first.
+        if self.form_filler is not None and self._filled_fields:
+            if self._is_submit_click(step):
+                pre_result = await self.form_filler.validate_before_submit(
+                    page, self._filled_fields, submit_selector=step.selector,
+                )
+                if not pre_result.valid:
+                    # Try to refill broken fields before submitting
+                    refilled = False
+                    for issue in pre_result.issues:
+                        if issue.issue in ("empty", "mismatch"):
+                            log.info(
+                                "pre-submit: refilling %s (issue=%s)",
+                                issue.field_selector, issue.issue,
+                            )
+                            r = await self.form_filler.fill_field(
+                                page, issue.field_selector, issue.expected,
+                            )
+                            if r.success:
+                                refilled = True
+                            else:
+                                raise RuntimeError(
+                                    f"pre-submit validation failed: "
+                                    f"field={issue.field_selector} "
+                                    f"issue={issue.issue} "
+                                    f"expected={issue.expected!r} "
+                                    f"actual={issue.actual!r}"
+                                )
+                        elif issue.issue == "submit_disabled":
+                            raise RuntimeError(
+                                f"submit button is disabled: {issue.field_selector}"
+                            )
+                        elif issue.issue == "error_visible":
+                            raise RuntimeError(
+                                "validation errors visible on page before submit"
+                            )
+                    if refilled:
+                        # Re-validate after refill
+                        recheck = await self.form_filler.validate_before_submit(
+                            page, self._filled_fields, submit_selector=step.selector,
+                        )
+                        if not recheck.valid:
+                            issues_str = ", ".join(
+                                f"{i.field_selector}:{i.issue}" for i in recheck.issues
+                            )
+                            raise RuntimeError(
+                                f"pre-submit still failing after refill: {issues_str}"
+                            )
+                # Clear filled fields after successful submit
+                self._filled_fields.clear()
+
         if step.selector:
+            # When the obstruction detector is configured, use it to
+            # ensure the click target is visible, in viewport, and
+            # not occluded by a banner or modal. The detector returns
+            # ``(clicked, probe, unblock)`` — a ``False`` ``clicked``
+            # means the click never happened (or raised after unblock),
+            # so we surface that as a regular step error.
+            if self.obstruction_detector is not None:
+                clicked, probe, unblock = await self.obstruction_detector.safe_click(
+                    page, step.selector, timeout_ms=step.timeout_ms,
+                )
+                # Stash diagnostics on the step's metadata so the
+                # reasoning panel / replay file shows *why* a click
+                # was retried or failed. Keys are namespaced to avoid
+                # colliding with caller-supplied metadata.
+                if step.metadata is None:
+                    step.metadata = {}
+                step.metadata["obstruction_probe"] = probe.to_dict()
+                if unblock is not None:
+                    step.metadata["obstruction_unblock"] = unblock.to_dict()
+                if not clicked:
+                    raise RuntimeError(
+                        f"safe_click refused: status={probe.status.value}"
+                        + (f" obstruction={probe.obstruction.description}"
+                           if probe.obstruction else "")
+                        + (f" error={probe.error!r}" if probe.error else "")
+                    )
+                return
+            # Fallback: plain Playwright click for callers that didn't
+            # opt into the obstruction detector.
             await page.click(step.selector, timeout=step.timeout_ms)
             return
         if step.intent:
@@ -161,10 +262,52 @@ class ActionExecutor:
             return
         raise ValueError("click step needs selector or intent")
 
+    def _is_submit_click(self, step: ActionStep) -> bool:
+        """Determine if a click step is likely a form submission."""
+        submit_intents = {
+            "submit", "register", "login", "continue", "confirm",
+            "send", "save", "apply", "done", "next", "proceed",
+        }
+        if step.intent and step.intent.lower() in submit_intents:
+            return True
+        if step.selector:
+            sel_lower = step.selector.lower()
+            if 'type="submit"' in sel_lower or "submit" in sel_lower:
+                return True
+        return False
+
+    def reset_filled_fields(self) -> None:
+        """Clear the tracked filled fields (call between goals)."""
+        self._filled_fields.clear()
+
     async def _fill(self, page: Any, step: ActionStep) -> None:
         if not step.selector:
             raise ValueError("fill step needs selector")
-        await page.fill(step.selector, step.value or "", timeout=step.timeout_ms)
+        value = step.value or ""
+
+        if self.form_filler is not None:
+            # Use the multi-strategy form filler with read-back verification
+            result = await self.form_filler.fill_field(
+                page, step.selector, value, timeout_ms=step.timeout_ms,
+            )
+            if not result.success:
+                raise RuntimeError(
+                    f"form_filler failed for {step.selector}: "
+                    f"strategy_used={result.strategy_used}, "
+                    f"expected={value!r}, actual={result.actual_value!r}, "
+                    f"error={result.error}"
+                )
+            # Track for pre-submit validation
+            self._filled_fields.append((step.selector, value))
+            log.debug(
+                "fill verified: selector=%s strategy=%s",
+                step.selector,
+                result.strategy_used.value if result.strategy_used else "?",
+            )
+        else:
+            # Legacy path: simple page.fill without verification
+            await page.fill(step.selector, value, timeout=step.timeout_ms)
+            self._filled_fields.append((step.selector, value))
 
     async def _screenshot(self, page: Any, step: ActionStep) -> str:
         path = self.screenshot_dir / f"step-{int(time.time() * 1000)}.png"

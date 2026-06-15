@@ -1,19 +1,51 @@
-"""Telegram controller.
+"""Telegram controller — the framework's primary control surface.
 
-Polls the Telegram Bot API (no third-party SDK required — uses ``urllib``)
-and forwards authorized commands to the local FastAPI backend.
+Polls the Telegram Bot API (no third-party SDK; uses ``urllib``) and
+forwards authorized commands to the local FastAPI backend. The bot is a
+full execution controller, not a monitoring dashboard: it can plan and
+execute tasks, stream live progress, cancel/resume runs, replay past
+runs, batch-execute against many accounts, and surface learned templates
+— all of it without touching JSON/YAML files or SSH.
 
-Configuration (any of):
-  - env ``TELEGRAM_BOT_TOKEN`` and ``TELEGRAM_ALLOWED_CHAT_IDS`` (comma-separated)
-  - config keys ``telegram.token`` and ``telegram.allowed_chat_ids`` (list[int])
+Configuration (any of the below):
+  - env ``TELEGRAM_BOT_TOKEN`` and ``TELEGRAM_ALLOWED_CHAT_IDS`` (csv)
+  - config keys ``telegram.token`` and ``telegram.allowed_chat_ids``
 
-Authorization: only chat IDs in the allow-list may issue commands. Unknown
-senders are ignored silently and logged.
+Authorization is allow-list only. Unknown chat IDs are dropped silently
+and logged.
 
-Supported commands:
-  /start /stop /restart /status /reload /health /plugins /logs /workers
+Three command groups
+====================
+
+Execution (the new control center)
+  /run [text]        plan + ask confirmation + execute
+  /plan [text]       preview a plan (no execution)
+  /newtask           same as /run, prompts for the instruction
+  /batch [text]      multi-account NL with explicit batching
+  /watch [run_id]    stream live progress to this chat
+  /unwatch [run_id]  stop streaming
+  /cancel [run_id]   cancel a running execution
+  /resume <run_id>   resume from the last checkpoint
+  /replay <run_id> [account_id]
+                     fetch a replay summary
+  /templates         list learned page templates (replay-first cache)
+  /runs [N]          recent runs
+  /runinfo <run_id>  detail for one run
+  /wf <name> [account_id]
+                     run a workflow (optionally bound to one account)
+  /wfbatch <name> <account_ids…>
+                     run a workflow against many accounts
+  /abort             discard pending un-confirmed plan
+
+Monitoring (kept from the old bot)
+  /status /health /plugins /logs /workers /queue /workflows /ai
   /accounts /completed /failed /rejected /reload_accounts
-  /queue /workflows /ai
+
+Help
+  /start /help
+
+Free text (no leading slash) is treated as a natural-language
+instruction and goes through the same /run flow.
 """
 from __future__ import annotations
 
@@ -21,17 +53,70 @@ import asyncio
 import json
 import logging
 import os
+import secrets
+import time
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass, field
 from typing import Any
 
 log = logging.getLogger(__name__)
 
 API = "https://api.telegram.org"
 
+# Soft cap so a single Telegram message never exceeds the 4096-char limit.
+_MAX_TG_CHARS = 3500
+
+# Watcher loop tuning — kept friendly to Telegram's ~30 msg/s/user budget.
+_WATCH_POLL_S = 1.5
+_WATCH_BATCH_S = 2.0
+# Allow a few transient API failures inside the watcher before giving up.
+_WATCH_MAX_API_FAILURES = 5
+# Pending plans (un-confirmed) become stale and refuse to execute after this.
+_PENDING_PLAN_TTL_S = 600.0
+
+
+# ---------------------------------------------------------------- session
+
+
+@dataclass
+class PendingPlan:
+    """A plan awaiting user confirmation before execution."""
+
+    token: str
+    instruction: str
+    plan: dict[str, Any]
+    preview: dict[str, Any]
+    parallel: bool
+    max_parallel: int | None
+    created_at: float = field(default_factory=time.time)
+
+
+@dataclass
+class WatchSession:
+    """One live-stream of a run to a chat."""
+
+    run_id: str
+    cursor: int = 0
+    task: asyncio.Task[None] | None = None
+
+
+@dataclass
+class ChatSession:
+    """Per-chat state held in memory only — survives restarts via Telegram itself."""
+
+    chat_id: int
+    pending_plan: PendingPlan | None = None
+    awaiting: str | None = None  # e.g. "instruction" after /newtask
+    watchers: dict[str, WatchSession] = field(default_factory=dict)
+    last_run_id: str | None = None
+
+
+# ---------------------------------------------------------------- controller
+
 
 class TelegramController:
-    """Long-polling Telegram bot that forwards commands to the local API."""
+    """Long-polling Telegram bot that drives the framework's HTTP API."""
 
     def __init__(
         self,
@@ -41,12 +126,14 @@ class TelegramController:
         api_token: str | None = None,
     ) -> None:
         self.token = token
-        self.allowed = set(int(x) for x in allowed_chat_ids if str(x).strip())
+        self.allowed = {int(x) for x in allowed_chat_ids if str(x).strip()}
         self.api_base_url = api_base_url.rstrip("/")
         self.api_token = api_token
+
         self._offset = 0
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+        self._sessions: dict[int, ChatSession] = {}
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "TelegramController | None":
@@ -71,90 +158,391 @@ class TelegramController:
             return
         self._stop.clear()
         self._task = asyncio.create_task(self._poll_loop(), name="telegram-poll")
-        log.info("Telegram controller started (allowed chats: %s)", sorted(self.allowed))
+        log.info(
+            "Telegram controller started (allowed chats: %s)", sorted(self.allowed),
+        )
 
     async def stop(self) -> None:
         self._stop.set()
+        # Cancel watcher tasks AND wait for them to drain so in-flight sends
+        # complete (and asyncio doesn't warn about destroyed pending tasks).
+        watcher_tasks: list[asyncio.Task[None]] = []
+        for sess in self._sessions.values():
+            for w in list(sess.watchers.values()):
+                if w.task and not w.task.done():
+                    w.task.cancel()
+                    watcher_tasks.append(w.task)
+        if watcher_tasks:
+            await asyncio.gather(*watcher_tasks, return_exceptions=True)
         if self._task:
-            await self._task
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
 
-    # ------------------------------------------------------------------- I/O
+    # ------------------------------------------------------------------- poll
     async def _poll_loop(self) -> None:
+        if not self.allowed:
+            # Fail-closed: refuse to accept any updates when no operator is on
+            # the allow-list. The pre-rewrite bot fell open here because it was
+            # monitoring-only; the rewrite can execute plans, so a missing
+            # allow-list is a footgun, not a convenience.
+            log.error(
+                "Telegram allow-list is empty — refusing to process any updates."
+                " Set TELEGRAM_ALLOWED_CHAT_IDS or telegram.allowed_chat_ids."
+            )
+            await self._stop.wait()
+            return
+
         while not self._stop.is_set():
             try:
+                # ``allowed_updates`` keeps the stream tight and lets Telegram
+                # know we want callback queries (inline keyboard taps).
                 updates = await self._call(
-                    "getUpdates", {"timeout": 25, "offset": self._offset}
+                    "getUpdates",
+                    {
+                        "timeout": 25,
+                        "offset": self._offset,
+                        "allowed_updates": json.dumps(
+                            ["message", "edited_message", "callback_query"],
+                        ),
+                    },
                 )
-                for u in updates.get("result", []):
+                for u in updates.get("result", []) or []:
                     self._offset = u["update_id"] + 1
-                    await self._handle_update(u)
+                    try:
+                        await self._handle_update(u)
+                    except Exception:  # noqa: BLE001
+                        log.exception("telegram update handler failed")
             except Exception:  # noqa: BLE001
                 log.exception("telegram poll error")
                 await asyncio.sleep(5)
 
+    # ------------------------------------------------------------- dispatcher
     async def _handle_update(self, update: dict[str, Any]) -> None:
+        if "callback_query" in update:
+            await self._handle_callback(update["callback_query"])
+            return
+
         msg = update.get("message") or update.get("edited_message") or {}
         chat = msg.get("chat") or {}
         chat_id = chat.get("id")
         text = (msg.get("text") or "").strip()
         if not chat_id or not text:
             return
-        if self.allowed and chat_id not in self.allowed:
+        if not self._authorized(chat_id):
             log.warning("telegram: rejecting unauthorized chat_id=%s", chat_id)
             return
-        try:
-            reply = await self._dispatch(text)
-        except Exception as exc:  # noqa: BLE001
-            reply = f"error: {exc}"
-        await self._send(chat_id, reply)
 
-    async def _dispatch(self, text: str) -> str:
-        # split on whitespace; first token is /command
-        parts = text.split()
-        cmd = parts[0].lower().lstrip("/").split("@", 1)[0]
-        args = parts[1:]
-        if cmd in {"start"}:
-            return _summary(await self._api("POST", "/control/start"))
-        if cmd in {"stop"}:
-            return _summary(await self._api("POST", "/control/stop"))
-        if cmd in {"restart"}:
-            return _summary(await self._api("POST", "/control/restart"))
-        if cmd in {"reload"}:
-            return _summary(await self._api("POST", "/control/reload"))
-        if cmd in {"status"}:
-            return _summary(await self._api("GET", "/status"), keys=("running", "status"))
-        if cmd in {"health"}:
+        sess = self._session(chat_id)
+
+        # If the chat is in a "fill in the blank" state, take the text as
+        # input for whatever was asked.
+        if sess.awaiting == "instruction":
+            sess.awaiting = None
+            await self._begin_run_flow(sess, text, batch_hint=False)
+            return
+        if sess.awaiting == "batch_instruction":
+            sess.awaiting = None
+            await self._begin_run_flow(sess, text, batch_hint=True)
+            return
+
+        # Slash command vs. natural language.
+        if text.startswith("/"):
+            await self._dispatch_command(sess, text)
+        else:
+            # Treat any free-form text as an NL instruction.
+            await self._begin_run_flow(sess, text, batch_hint=False)
+
+    async def _dispatch_command(self, sess: ChatSession, text: str) -> None:
+        parts = text.split(maxsplit=1)
+        head = parts[0].lower().lstrip("/").split("@", 1)[0]
+        body = parts[1].strip() if len(parts) > 1 else ""
+        args = body.split() if body else []
+
+        try:
+            reply = await self._run_command(sess, head, body, args)
+        except _Reply as r:  # explicit pre-formatted reply (skip default send)
+            if r.text:
+                await self._send(sess.chat_id, r.text, reply_markup=r.markup)
+            return
+        except Exception as exc:  # noqa: BLE001
+            log.exception("command failed: /%s", head)
+            reply = f"error: {exc}"
+
+        if reply:
+            await self._send(sess.chat_id, reply)
+
+    # ------------------------------------------------------------- callback
+    async def _handle_callback(self, cq: dict[str, Any]) -> None:
+        cq_id = cq.get("id")
+        chat = (cq.get("message") or {}).get("chat") or {}
+        chat_id = chat.get("id")
+        data = cq.get("data") or ""
+        if not chat_id:
+            await self._answer_callback(cq_id, "no chat", alert=False)
+            return
+        if not self._authorized(chat_id):
+            await self._answer_callback(cq_id, "unauthorized", alert=True)
+            return
+
+        sess = self._session(chat_id)
+        action, _, token = data.partition(":")
+
+        if action == "confirm":
+            pending = sess.pending_plan
+            if not pending or pending.token != token:
+                await self._answer_callback(cq_id, "plan expired", alert=True)
+                return
+            if (time.time() - pending.created_at) > _PENDING_PLAN_TTL_S:
+                sess.pending_plan = None
+                await self._answer_callback(cq_id, "plan expired (TTL)", alert=True)
+                await self._send(chat_id, "plan expired — please /run again")
+                return
+            await self._answer_callback(cq_id, "starting…")
+            await self._execute_pending(sess, pending)
+            return
+
+        if action == "cancel":
+            pending = sess.pending_plan
+            if pending and pending.token == token:
+                sess.pending_plan = None
+                await self._answer_callback(cq_id, "discarded")
+                await self._send(chat_id, "plan discarded")
+            else:
+                await self._answer_callback(cq_id, "nothing to cancel")
+            return
+
+        if action == "watch":
+            await self._answer_callback(cq_id, "watching")
+            await self._start_watch(sess, token)
+            return
+
+        if action == "stop":
+            await self._answer_callback(cq_id, "cancelling")
+            await self._cancel_run(sess, token)
+            return
+
+        # ---------- v2 control-center actions ---------------------------
+        # ``token`` is the run_id for these actions (set when the inline
+        # keyboard is constructed in ``_execute_pending``).
+        if action == "pause":
+            await self._answer_callback(cq_id, "pausing…")
+            try:
+                resp = await self._api("POST", f"/agent/runs/{token}/pause")
+            except _ApiError as exc:
+                await self._send(chat_id, f"pause failed: {exc}")
+                return
+            await self._send(
+                chat_id, f"⏸ paused {token} ({resp.get('status', 'paused')})",
+            )
+            return
+
+        if action == "resume":
+            await self._answer_callback(cq_id, "resuming…")
+            try:
+                resp = await self._api(
+                    "POST", f"/agent/runs/{token}/resume_paused",
+                )
+            except _ApiError as exc:
+                await self._send(chat_id, f"resume failed: {exc}")
+                return
+            await self._send(
+                chat_id, f"▶ resumed {token} ({resp.get('status', 'running')})",
+            )
+            return
+
+        if action == "status":
+            await self._answer_callback(cq_id, "fetching status…")
+            try:
+                resp = await self._api("GET", f"/agent/runs/{token}")
+            except _ApiError as exc:
+                await self._send(chat_id, f"status failed: {exc}")
+                return
+            await self._send(chat_id, _format_run_status(resp))
+            return
+
+        if action == "reasoning":
+            await self._answer_callback(cq_id, "fetching reasoning…")
+            await self._send_reasoning(sess, run_id=token)
+            return
+
+        if action == "screenshots":
+            await self._answer_callback(cq_id, "fetching screenshots…")
+            await self._send_screenshots(sess, run_id=token)
+            return
+
+        if action == "replay":
+            await self._answer_callback(cq_id, "fetching replay…")
+            text = await self._format_replay(token, None)
+            await self._send(chat_id, text or f"no replay data for {token}")
+            return
+
+        # Main menu navigation callbacks
+        if action == "menu":
+            await self._answer_callback(cq_id, "")
+            await self._send_main_menu(sess)
+            return
+
+        if action == "menu_run":
+            await self._answer_callback(cq_id, "")
+            sess.awaiting = "instruction"
+            await self._send(
+                chat_id,
+                "Send your task instruction now.\n\n"
+                "Example:\n"
+                "Create 5 accounts. Password: Test@123.\n"
+                "Visit https://example.com\n"
+                "Register. Login. Claim reward. Complete onboarding.",
+            )
+            return
+
+        if action == "menu_runs":
+            await self._answer_callback(cq_id, "loading…")
+            text = await self._format_runs(10)
+            await self._send(chat_id, text)
+            return
+
+        if action == "menu_templates":
+            await self._answer_callback(cq_id, "loading…")
+            text = await self._format_templates()
+            await self._send(chat_id, text)
+            return
+
+        if action == "menu_stats":
+            await self._answer_callback(cq_id, "loading…")
+            await self._send_stats(sess)
+            return
+
+        if action == "menu_settings":
+            await self._answer_callback(cq_id, "")
+            await self._send(chat_id, _HELP)
+            return
+
+        # ------- cleanup menu / actions -----------------------------------
+        # All cleanup callbacks live behind the ``clear`` and ``cleanup``
+        # action prefixes; ``token`` carries colon-joined arguments.
+        if action == "menu_cleanup":
+            await self._answer_callback(cq_id, "")
+            await self._send_cleanup_menu(sess)
+            return
+        if action == "menu_storage":
+            await self._answer_callback(cq_id, "loading…")
+            await self._send_storage_summary(sess)
+            return
+        if action == "menu_settings_retention":
+            await self._answer_callback(cq_id, "")
+            await self._send_retention_settings(sess)
+            return
+
+        if action == "clear":
+            # token is "<op>" or "<op>:<run_id>"
+            op_part, _sep, run_part = token.partition(":")
+            await self._answer_callback(cq_id, f"clearing {op_part}…")
+            await self._handle_clear_callback(
+                sess, op=op_part, run_id=(run_part or None),
+            )
+            return
+
+        if action == "rset":
+            # token is "<setting_key>:<value>"
+            key, _sep, value = token.partition(":")
+            await self._answer_callback(cq_id, "saving…")
+            await self._handle_setting_callback(sess, key=key, value=value)
+            return
+
+        await self._answer_callback(cq_id, f"unknown action: {action}", alert=True)
+
+    # ---------------------------------------------------------- session util
+    def _session(self, chat_id: int) -> ChatSession:
+        sess = self._sessions.get(chat_id)
+        if sess is None:
+            sess = ChatSession(chat_id=chat_id)
+            self._sessions[chat_id] = sess
+        return sess
+
+    def _authorized(self, chat_id: int) -> bool:
+        """Allow-list check. Fails closed when the list is empty.
+
+        The bot can now execute plans, so an empty allow-list is treated as
+        "block everyone" rather than "allow everyone" (the old monitoring
+        bot's default). Operators must add at least one chat id explicitly.
+        """
+        return bool(self.allowed) and chat_id in self.allowed
+
+    # -------------------------------------------------------- command router
+    async def _run_command(
+        self,
+        sess: ChatSession,
+        cmd: str,
+        body: str,
+        args: list[str],
+    ) -> str:
+        # ----- discovery / monitoring (kept from the old bot) ------------
+        if cmd in {"start", "help", "?"}:
+            # /start sends the main menu as an inline keyboard for a
+            # consumer-grade UX, plus the help text as fallback.
+            await self._send_main_menu(sess)
+            raise _Reply("")
+
+        if cmd == "menu":
+            await self._send_main_menu(sess)
+            raise _Reply("")
+
+        if cmd == "stats":
+            await self._send_stats(sess)
+            raise _Reply("")
+
+        if cmd == "status":
+            return _summary(
+                await self._api("GET", "/status"),
+                keys=("running", "status"),
+            )
+        if cmd == "health":
             return _summary(await self._api("GET", "/health"))
-        if cmd in {"plugins"}:
+        if cmd == "plugins":
             data = await self._api("GET", "/plugins")
             lines = [
                 f"{p['name']} v{p.get('metadata', {}).get('version','?')} "
                 f"enabled={p['enabled']} started={p['started']}"
-                for p in data.get("plugins", [])
+                for p in data.get("plugins", []) or []
             ]
             return "\n".join(lines) or "no plugins"
-        if cmd in {"logs"}:
+        if cmd == "logs":
             name = args[0] if args else "activity"
             data = await self._api("GET", f"/logs/{name}?lines=20")
-            return "\n".join(data.get("lines", []))[-3500:] or "(empty)"
+            return "\n".join(data.get("lines", []))[-_MAX_TG_CHARS:] or "(empty)"
         if cmd in {"workers", "queue"}:
             data = await self._api("GET", "/status")
-            return json.dumps({
-                "scheduler": data.get("scheduler"),
-                "queues": data.get("queues"),
-            }, indent=2)
-        if cmd in {"accounts"}:
-            data = await self._api("GET", "/accounts/status")
-            return _format_accounts_status(data)
-        if cmd in {"completed"}:
+            return json.dumps(
+                {"scheduler": data.get("scheduler"), "queues": data.get("queues")},
+                indent=2,
+            )
+
+        # engine lifecycle
+        if cmd in {"engine_start", "engine"}:
+            return _summary(await self._api("POST", "/control/start"))
+        if cmd == "stop":
+            return _summary(await self._api("POST", "/control/stop"))
+        if cmd == "restart":
+            return _summary(await self._api("POST", "/control/restart"))
+        if cmd == "reload":
+            return _summary(await self._api("POST", "/control/reload"))
+
+        # accounts
+        if cmd == "accounts":
+            return _format_accounts_status(
+                await self._api("GET", "/accounts/status"),
+            )
+        if cmd == "completed":
             limit = int(args[0]) if args and args[0].isdigit() else 20
             data = await self._api("GET", f"/accounts/completed?limit={limit}")
             return _format_account_list(data, "completed")
-        if cmd in {"failed"}:
+        if cmd == "failed":
             limit = int(args[0]) if args and args[0].isdigit() else 20
             data = await self._api("GET", f"/accounts/failed?limit={limit}")
             return _format_account_list(data, "failed")
-        if cmd in {"rejected"}:
+        if cmd == "rejected":
             data = await self._api("GET", "/accounts/rejected?limit=20")
             entries = data.get("rejected", []) or []
             if not entries:
@@ -167,18 +555,1177 @@ class TelegramController:
                 f"reloaded: loaded={data.get('loaded', 0)} "
                 f"rejected={data.get('rejected', 0)}"
             )
-        if cmd in {"workflows"}:
-            data = await self._api("GET", "/workflows")
-            return "\n".join(data.get("workflows", [])) or "no workflows"
-        if cmd in {"ai"}:
+        if cmd == "ai":
             data = await self._api("GET", "/ai/status")
             return json.dumps(data, indent=2, default=str)
-        if cmd in {"help", "?"}:
-            return _HELP
+
+        # ------------------------- execution control center ---------------
+        if cmd == "run":
+            if not body:
+                sess.awaiting = "instruction"
+                return "send the instruction in your next message"
+            await self._begin_run_flow(sess, body, batch_hint=False)
+            raise _Reply("")  # response already sent
+
+        if cmd == "plan":
+            if not body:
+                return "usage: /plan <instruction>"
+            await self._send_plan_only(sess, body)
+            raise _Reply("")
+
+        if cmd == "newtask":
+            sess.awaiting = "instruction"
+            return (
+                "send the instruction in your next message — for example:\n"
+                "  Create 5 accounts on https://example.com/signup with "
+                "password Test@123. Then login and complete onboarding."
+            )
+
+        if cmd == "batch":
+            if not body:
+                sess.awaiting = "batch_instruction"
+                return (
+                    "send the batch instruction. Mention parallelism if you want it,"
+                    " e.g.\n"
+                    "  Accounts: 50 Parallel: 5\n"
+                    "  Register, login, complete onboarding."
+                )
+            await self._begin_run_flow(sess, body, batch_hint=True)
+            raise _Reply("")
+
+        if cmd == "abort":
+            if sess.pending_plan:
+                sess.pending_plan = None
+                return "pending plan discarded"
+            sess.awaiting = None
+            return "nothing pending"
+
+        if cmd == "watch":
+            run_id = args[0] if args else (sess.last_run_id or "")
+            if not run_id:
+                return "usage: /watch <run_id>"
+            await self._start_watch(sess, run_id)
+            raise _Reply("")
+
+        if cmd == "unwatch":
+            run_id = args[0] if args else ""
+            stopped = self._stop_watch(sess, run_id or None)
+            return f"stopped {stopped} watcher(s)" if stopped else "nothing to stop"
+
+        if cmd == "cancel":
+            run_id = args[0] if args else (sess.last_run_id or "")
+            if not run_id:
+                return "usage: /cancel <run_id>"
+            await self._cancel_run(sess, run_id)
+            raise _Reply("")
+
+        # ---------- v2 control-center commands --------------------------
+        if cmd == "pause":
+            run_id = args[0] if args else (sess.last_run_id or "")
+            if not run_id:
+                return "usage: /pause [run_id]"
+            try:
+                resp = await self._api("POST", f"/agent/runs/{run_id}/pause")
+            except _ApiError as exc:
+                return f"pause failed: {exc}"
+            return f"⏸ paused {run_id}: {resp.get('status', 'paused')}"
+
+        if cmd == "resume_paused":
+            # Distinct from /resume (resume from checkpoint). This lifts
+            # an in-flight pause without re-running anything.
+            run_id = args[0] if args else (sess.last_run_id or "")
+            if not run_id:
+                return "usage: /resume_paused [run_id]"
+            try:
+                resp = await self._api(
+                    "POST", f"/agent/runs/{run_id}/resume_paused",
+                )
+            except _ApiError as exc:
+                return f"resume_paused failed: {exc}"
+            return f"▶ resumed {run_id}: {resp.get('status', 'running')}"
+
+        if cmd == "reasoning":
+            run_id = args[0] if args else (sess.last_run_id or "")
+            if not run_id:
+                return "usage: /reasoning <run_id> [account_id]"
+            account_id = args[1] if len(args) > 1 else None
+            await self._send_reasoning(sess, run_id=run_id, account_id=account_id)
+            raise _Reply("")
+
+        if cmd == "screenshots":
+            run_id = args[0] if args else (sess.last_run_id or "")
+            if not run_id:
+                return "usage: /screenshots <run_id> [account_id]"
+            account_id = args[1] if len(args) > 1 else None
+            await self._send_screenshots(sess, run_id=run_id, account_id=account_id)
+            raise _Reply("")
+
+        if cmd == "dashboard":
+            run_id = args[0] if args else (sess.last_run_id or "")
+            if not run_id:
+                return "usage: /dashboard [run_id]"
+            await self._send_live_dashboard(sess, run_id)
+            raise _Reply("")
+
+        if cmd == "report":
+            run_id = args[0] if args else (sess.last_run_id or "")
+            if not run_id:
+                return "usage: /report [run_id]"
+            await self._send_run_report(sess, run_id)
+            raise _Reply("")
+
+        if cmd == "resume":
+            if not args:
+                return "usage: /resume <run_id>"
+            run_id = args[0]
+            data = await self._api("POST", f"/agent/runs/{run_id}/resume")
+            sess.last_run_id = run_id
+            return f"resuming {run_id}: {data.get('status', 'unknown')}"
+
+        if cmd == "replay":
+            if not args:
+                return "usage: /replay <run_id> [account_id]"
+            run_id = args[0]
+            account_id = args[1] if len(args) > 1 else None
+            return await self._format_replay(run_id, account_id)
+
+        if cmd == "templates":
+            return await self._format_templates()
+
+        if cmd == "runs":
+            limit = int(args[0]) if args and args[0].isdigit() else 10
+            return await self._format_runs(limit)
+
+        if cmd == "runinfo":
+            if not args:
+                return "usage: /runinfo <run_id>"
+            return await self._format_runinfo(args[0])
+
+        if cmd == "workflows":
+            data = await self._api("GET", "/workflows")
+            wfs = data.get("workflows", []) or []
+            return ("workflows:\n" + "\n".join(f"  - {w}" for w in wfs)) if wfs \
+                else "no workflows"
+
+        if cmd == "wf":
+            if not args:
+                return "usage: /wf <name> [account_id]"
+            name = args[0]
+            account_id = args[1] if len(args) > 1 else None
+            payload: dict[str, Any] = {}
+            if account_id:
+                payload["account_id"] = account_id
+            data = await self._api(
+                "POST", f"/workflows/{name}/run", body=payload,
+            )
+            return (
+                f"workflow {name} started"
+                + (f" for account {account_id}" if account_id else "")
+                + f"\nstatus: {data.get('status', 'unknown')}"
+            )
+
+        if cmd == "wfbatch":
+            if len(args) < 2:
+                return "usage: /wfbatch <name> <account_id1> <account_id2> …"
+            name = args[0]
+            account_ids = args[1:]
+            data = await self._api(
+                "POST",
+                f"/workflows/{name}/run_for_accounts",
+                body={
+                    "account_ids": account_ids,
+                    "parallel": len(account_ids) > 1,
+                    "max_parallel": min(4, len(account_ids)),
+                },
+            )
+            return (
+                f"workflow {name} batch started for {len(account_ids)} account(s)"
+                f"\nstatus: {data.get('status', 'unknown')}"
+            )
+
+        # ------------------------ telemetry cleanup -----------------------
+        # All five operator-facing /clear_* commands share the same shape:
+        #   /clear_<thing> [run_id] [account_id]
+        # When ``run_id`` is omitted the sweep is global. /clear_chat is
+        # the composite (logs + reasoning + screenshots) bound to one
+        # button on the menu.
+        if cmd in {
+            "clear_chat", "clear_logs", "clear_runs",
+            "clear_screenshots", "clear_reasoning",
+        }:
+            run_id = args[0] if args else None
+            account_id = args[1] if len(args) > 1 else None
+            return await self._format_cleanup_command(
+                op=cmd.replace("clear_", ""),
+                run_id=run_id,
+                account_id=account_id,
+            )
+
+        if cmd == "clear_apply":
+            try:
+                resp = await self._api("POST", "/telemetry/apply")
+            except _ApiError as exc:
+                return f"apply failed: {exc}"
+            return _format_cleanup_result(resp, op="apply settings")
+
+        if cmd in {"clear_settings", "retention", "retention_settings"}:
+            await self._send_retention_settings(sess)
+            raise _Reply("")
+
+        if cmd == "cleanup":
+            # Open the cleanup menu (same as the main-menu button).
+            await self._send_cleanup_menu(sess)
+            raise _Reply("")
+
+        if cmd == "storage":
+            await self._send_storage_summary(sess)
+            raise _Reply("")
+
         return f"unknown command: /{cmd}\n\n{_HELP}"
 
-    # ------------------------------------------------------------- HTTP utils
-    async def _api(self, method: str, path: str, body: dict | None = None) -> dict:
+    # ------------------------------------------------------------ run flow
+    async def _begin_run_flow(
+        self, sess: ChatSession, instruction: str, *, batch_hint: bool,
+    ) -> None:
+        """Build a plan from NL and ask the user to confirm execution."""
+        try:
+            plan_resp = await self._api(
+                "POST", "/agent/plan", body={"instruction": instruction},
+            )
+        except _ApiError as exc:
+            await self._send(sess.chat_id, f"plan failed: {exc}")
+            return
+
+        plan = plan_resp.get("plan") or {}
+        preview = plan_resp.get("preview") or {}
+
+        # If the user explicitly said "batch", let plan.parallel be true and
+        # bump max_parallel accordingly when not already set.
+        parallel = bool(plan.get("parallel", False))
+        max_parallel = plan.get("max_parallel")
+        if batch_hint and not parallel:
+            parallel = True
+            max_parallel = max_parallel or min(
+                int(plan.get("account_config", {}).get("count", 4)) or 4, 4,
+            )
+
+        token = secrets.token_hex(4)
+        sess.pending_plan = PendingPlan(
+            token=token,
+            instruction=instruction,
+            plan=plan,
+            preview=preview,
+            parallel=parallel,
+            max_parallel=int(max_parallel) if max_parallel else None,
+        )
+
+        text = _format_plan_preview(preview, parallel, max_parallel)
+        markup = json.dumps({
+            "inline_keyboard": [[
+                {"text": "Confirm & Run", "callback_data": f"confirm:{token}"},
+                {"text": "Cancel", "callback_data": f"cancel:{token}"},
+            ]],
+        })
+        await self._send(sess.chat_id, text, reply_markup=markup)
+
+    async def _send_plan_only(self, sess: ChatSession, instruction: str) -> None:
+        try:
+            resp = await self._api(
+                "POST", "/agent/plan", body={"instruction": instruction},
+            )
+        except _ApiError as exc:
+            await self._send(sess.chat_id, f"plan failed: {exc}")
+            return
+        preview = resp.get("preview") or {}
+        plan = resp.get("plan") or {}
+        text = _format_plan_preview(
+            preview,
+            bool(plan.get("parallel", False)),
+            plan.get("max_parallel"),
+            footer="Use /run to execute.",
+        )
+        await self._send(sess.chat_id, text)
+
+    async def _execute_pending(self, sess: ChatSession, pending: PendingPlan) -> None:
+        """User confirmed — submit the plan and start a watcher."""
+        body = {
+            "instruction": pending.instruction,
+            "plan": pending.plan,
+            "parallel": pending.parallel,
+        }
+        if pending.max_parallel is not None:
+            body["max_parallel"] = pending.max_parallel
+
+        try:
+            resp = await self._api("POST", "/agent/run", body=body)
+        except _ApiError as exc:
+            # Keep the pending plan so the user can /run again or tap Confirm
+            # on the same message after fixing the cause (network blip, etc.)
+            await self._send(
+                sess.chat_id,
+                f"failed to start run: {exc}\nplan kept — tap Confirm again to retry",
+            )
+            return
+
+        # Submission succeeded — burn the token so a stale tap can't double-run.
+        if sess.pending_plan is pending:
+            sess.pending_plan = None
+
+        run_id = resp.get("run_id") or ""
+        accounts = resp.get("accounts") or []
+        sess.last_run_id = run_id
+
+        # Inline buttons: a compact "control center" right next to the
+        # run announcement. Telegram caps each row at ~8 buttons but
+        # readability caps it earlier; two short rows look best on
+        # both desktop and mobile.
+        markup = json.dumps({
+            "inline_keyboard": [
+                [
+                    {"text": "👀 Watch",      "callback_data": f"watch:{run_id}"},
+                    {"text": "⏸ Pause",       "callback_data": f"pause:{run_id}"},
+                    {"text": "▶ Resume",     "callback_data": f"resume:{run_id}"},
+                    {"text": "❌ Stop",       "callback_data": f"stop:{run_id}"},
+                ],
+                [
+                    {"text": "📊 Status",      "callback_data": f"status:{run_id}"},
+                    {"text": "🧠 Reasoning",   "callback_data": f"reasoning:{run_id}"},
+                    {"text": "📷 Screenshots", "callback_data": f"screenshots:{run_id}"},
+                    {"text": "🔄 Replay",      "callback_data": f"replay:{run_id}"},
+                ],
+            ],
+        })
+        msg = (
+            f"started {run_id}\n"
+            f"accounts: {len(accounts)}\n"
+            f"goals:    {resp.get('goals', '?')}\n"
+            f"target:   {resp.get('target_url') or '(none)'}\n"
+            "tap a button below to control or inspect this run."
+        )
+        await self._send(sess.chat_id, msg, reply_markup=markup)
+
+        # Auto-start the watcher so users get progress without an extra tap.
+        await self._start_watch(sess, run_id, announce=False)
+
+    # ----------------------------------------------------------- live watch
+    async def _start_watch(
+        self, sess: ChatSession, run_id: str, *, announce: bool = True,
+    ) -> None:
+        if not run_id:
+            return
+        if run_id in sess.watchers:
+            if announce:
+                await self._send(sess.chat_id, f"already watching {run_id}")
+            return
+        ws = WatchSession(run_id=run_id)
+        ws.task = asyncio.create_task(
+            self._watch_loop(sess, ws),
+            name=f"tg-watch-{sess.chat_id}-{run_id}",
+        )
+        sess.watchers[run_id] = ws
+        if announce:
+            await self._send(sess.chat_id, f"watching {run_id}")
+
+    def _stop_watch(self, sess: ChatSession, run_id: str | None) -> int:
+        """Cancel watcher tasks. Identity-checks the dict pop so a freshly
+        spawned watcher is never disowned by an in-flight cancel."""
+        targets = list(sess.watchers.keys()) if not run_id else [run_id]
+        stopped = 0
+        for rid in targets:
+            ws = sess.watchers.get(rid)
+            if ws is None:
+                continue
+            # Pop only when the dict still points at the same WatchSession
+            # we found — otherwise we'd evict a successor watcher started
+            # in the gap between cancel and finally.
+            if sess.watchers.get(rid) is ws:
+                sess.watchers.pop(rid, None)
+            if ws.task and not ws.task.done():
+                ws.task.cancel()
+                stopped += 1
+        return stopped
+
+    async def _cancel_run(self, sess: ChatSession, run_id: str) -> None:
+        try:
+            resp = await self._api("POST", f"/agent/runs/{run_id}/cancel")
+        except _ApiError as exc:
+            await self._send(sess.chat_id, f"cancel failed: {exc}")
+            return
+        await self._send(
+            sess.chat_id,
+            f"cancel requested for {run_id}: {resp.get('status', 'ok')}",
+        )
+
+    async def _watch_loop(self, sess: ChatSession, ws: WatchSession) -> None:
+        """Tail the run's events and post compact updates to the chat.
+
+        Buffers events for a short window so chats don't get flooded one
+        message per event. Tolerates short bursts of transient API errors
+        before giving up. Loop exits when the run reaches a terminal state
+        or the task is cancelled.
+        """
+        run_id = ws.run_id
+        terminal = {"completed", "failed", "cancelled"}
+        last_post = 0.0
+        buffer: list[dict[str, Any]] = []
+        consecutive_errors = 0
+
+        try:
+            await self._send(sess.chat_id, f"[{run_id}] streaming…")
+            while True:
+                try:
+                    resp = await self._api(
+                        "GET",
+                        f"/agent/runs/{run_id}/events_tail?cursor={ws.cursor}",
+                    )
+                except _ApiError as exc:
+                    consecutive_errors += 1
+                    if consecutive_errors >= _WATCH_MAX_API_FAILURES:
+                        await self._send(
+                            sess.chat_id,
+                            f"[{run_id}] watch giving up after "
+                            f"{consecutive_errors} errors: {exc}",
+                        )
+                        break
+                    # Exponential-ish backoff so we don't hammer a flaky API.
+                    await asyncio.sleep(_WATCH_POLL_S * consecutive_errors)
+                    continue
+
+                consecutive_errors = 0
+                ws.cursor = int(resp.get("cursor") or ws.cursor)
+                buffer.extend(resp.get("events") or [])
+
+                now = time.time()
+                if buffer and (now - last_post) >= _WATCH_BATCH_S:
+                    text = _format_event_batch(run_id, buffer)
+                    if text:
+                        await self._send(sess.chat_id, text)
+                    buffer.clear()
+                    last_post = now
+
+                status = resp.get("status")
+                if status in terminal and not buffer:
+                    await self._send(sess.chat_id, f"[{run_id}] done — {status}")
+                    # Send post-run report automatically
+                    await self._send_run_report(sess, run_id)
+                    break
+
+                await asyncio.sleep(_WATCH_POLL_S)
+
+        except asyncio.CancelledError:
+            try:
+                await self._send(sess.chat_id, f"[{run_id}] watch stopped")
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+        finally:
+            # Identity-checked removal: only evict when this very task is
+            # still the registered watcher, not a successor spawned during
+            # cancellation.
+            if sess.watchers.get(run_id) is ws:
+                sess.watchers.pop(run_id, None)
+
+    # --------------------------------------------------------- formatters
+    async def _format_runs(self, limit: int) -> str:
+        try:
+            data = await self._api("GET", f"/agent/runs?limit={limit}")
+        except _ApiError as exc:
+            return f"runs failed: {exc}"
+        active = data.get("active") or {}
+        stored = data.get("runs") or []
+        lines: list[str] = []
+        if active:
+            lines.append("active:")
+            for rid, info in active.items():
+                lines.append(f"  - {rid}  {info.get('status', '?')}")
+        if stored:
+            lines.append("recent:")
+            for r in stored:
+                rid = r.get("run_id") or "?"
+                st = r.get("status", "?")
+                instr = (r.get("instruction") or "").replace("\n", " ")[:60]
+                lines.append(f"  - {rid}  {st}  {instr}")
+        return "\n".join(lines) or "no runs"
+
+    async def _format_runinfo(self, run_id: str) -> str:
+        try:
+            data = await self._api("GET", f"/agent/runs/{run_id}")
+        except _ApiError as exc:
+            return f"runinfo failed: {exc}"
+        run = data.get("run") or {}
+        active = data.get("active")
+        accs = run.get("accounts") or []
+        lines = [
+            f"run:      {run.get('run_id', run_id)}",
+            f"status:   {run.get('status', '?')}",
+            f"active:   {bool(active)}",
+            f"accounts: {len(accs)}",
+            f"goals:    {len(run.get('goals') or [])}",
+        ]
+        if run.get("instruction"):
+            lines.append(f"goal:     {run['instruction'][:200]}")
+        if run.get("error"):
+            lines.append(f"error:    {run['error'][:200]}")
+        return "\n".join(lines)
+
+    async def _format_replay(
+        self, run_id: str, account_id: str | None,
+    ) -> str:
+        if not account_id:
+            try:
+                run = (await self._api("GET", f"/agent/runs/{run_id}")).get("run") or {}
+            except _ApiError as exc:
+                return f"replay failed: {exc}"
+            accs = run.get("accounts") or []
+            if not accs:
+                return "no accounts in run"
+            account_id = accs[0]
+        try:
+            data = await self._api(
+                "GET", f"/agent/runs/{run_id}/replay/{account_id}",
+            )
+        except _ApiError as exc:
+            return f"replay failed: {exc}"
+        replay = data.get("replay") or []
+        if not replay:
+            return f"no replay records for {account_id}"
+        return _format_replay_records(run_id, account_id, replay)
+
+    # ----------------------------------------------------------- v2 helpers
+    async def _send_main_menu(self, sess: ChatSession) -> None:
+        """Send the consumer-grade main menu with button grid."""
+        markup = json.dumps({
+            "inline_keyboard": [
+                [
+                    {"text": "▶ Run Task", "callback_data": "menu_run:_"},
+                    {"text": "📋 Plans", "callback_data": "menu_runs:_"},
+                ],
+                [
+                    {"text": "📊 Active Runs", "callback_data": "menu_runs:_"},
+                    {"text": "📁 Templates", "callback_data": "menu_templates:_"},
+                ],
+                [
+                    {"text": "📈 Statistics", "callback_data": "menu_stats:_"},
+                    {"text": "🧹 Cleanup", "callback_data": "menu_cleanup:_"},
+                ],
+                [
+                    {"text": "⚙ Settings / Help", "callback_data": "menu_settings:_"},
+                ],
+            ],
+        })
+        await self._send(
+            sess.chat_id,
+            "🤖 *Web Automation Control Center*\n\n"
+            "Choose an action below, or simply type your task as a message.\n\n"
+            "Examples:\n"
+            '• "Create 5 accounts on https://site.com"\n'
+            '• "Register, login, claim daily reward"\n'
+            '• "Download report from dashboard"',
+            reply_markup=markup,
+        )
+
+    async def _send_stats(self, sess: ChatSession) -> None:
+        """Send AI cost / performance statistics."""
+        try:
+            status_data = await self._api("GET", "/status")
+        except _ApiError:
+            status_data = {}
+
+        try:
+            ai_data = await self._api("GET", "/ai/status")
+        except _ApiError:
+            ai_data = {}
+
+        try:
+            runs_data = await self._api("GET", "/agent/runs?limit=50")
+        except _ApiError:
+            runs_data = {}
+
+        # Build stats summary
+        active_runs = runs_data.get("active") or {}
+        all_runs = runs_data.get("runs") or []
+        total_runs = len(all_runs) + len(active_runs)
+        completed = sum(1 for r in all_runs if r.get("status") == "completed")
+        failed = sum(1 for r in all_runs if r.get("status") == "failed")
+
+        ai_enabled = ai_data.get("enabled", False)
+        ai_calls = ai_data.get("total_calls", 0)
+        tokens_used = ai_data.get("total_tokens", 0)
+        template_replays = ai_data.get("template_replays", 0)
+
+        lines = [
+            "📈 *Statistics*\n",
+            f"Total Runs:        {total_runs}",
+            f"Active Now:        {len(active_runs)}",
+            f"Completed:         {completed}",
+            f"Failed:            {failed}",
+            f"Success Rate:      {(completed / max(total_runs, 1) * 100):.1f}%",
+            "",
+            "🧠 *AI Usage*",
+            f"AI Enabled:        {'Yes' if ai_enabled else 'No'}",
+            f"AI Calls:          {ai_calls}",
+            f"Tokens Used:       {tokens_used:,}",
+            f"Template Replays:  {template_replays}",
+            f"AI Savings:        {(template_replays / max(ai_calls + template_replays, 1) * 100):.1f}%",
+            "",
+            "⚡ *Engine*",
+            f"Status:            {status_data.get('status', 'unknown')}",
+        ]
+        await self._send(sess.chat_id, "\n".join(lines))
+
+    # --------------------------------------------------------- cleanup UI
+    async def _send_cleanup_menu(self, sess: ChatSession) -> None:
+        """Render the operator-facing cleanup buttons.
+
+        Each button maps to one of the bot's /clear_* commands. The
+        first row are the "destroy" actions (one tap = one HTTP call);
+        the bottom row leads into retention settings + storage usage,
+        which are *informational* rather than destructive.
+
+        ``clear:<op>`` is the callback shape; ``run_id`` is supplied
+        when the cleanup is scoped (we'll use the session's last
+        ``run_id`` so a tap always means "this run", never "every run
+        ever").
+        """
+        run_id = sess.last_run_id or ""
+        scope_token = f":{run_id}" if run_id else ""
+        scope_label = run_id[:14] if run_id else "all runs"
+        markup = json.dumps({
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "🗑 Clear Chat",
+                        "callback_data": f"clear:chat{scope_token}",
+                    },
+                    {
+                        "text": "🗑 Screenshots",
+                        "callback_data": f"clear:screenshots{scope_token}",
+                    },
+                ],
+                [
+                    {
+                        "text": "🗑 Logs",
+                        "callback_data": f"clear:logs{scope_token}",
+                    },
+                    {
+                        "text": "🗑 Reasoning",
+                        "callback_data": f"clear:reasoning{scope_token}",
+                    },
+                ],
+                [
+                    {
+                        "text": "🗑 Run History",
+                        "callback_data": "clear:runs",
+                    },
+                    {
+                        "text": "🗑 Completed Runs",
+                        "callback_data": "clear:runs_completed",
+                    },
+                ],
+                [
+                    {
+                        "text": "⚙ Retention Settings",
+                        "callback_data": "menu_settings_retention:_",
+                    },
+                    {
+                        "text": "📦 Storage Usage",
+                        "callback_data": "menu_storage:_",
+                    },
+                ],
+                [
+                    {"text": "← Back", "callback_data": "menu:_"},
+                ],
+            ],
+        })
+        await self._send(
+            sess.chat_id,
+            "🧹 *Cleanup*\n\n"
+            f"Scope: *{scope_label}*\n"
+            "Pick an action below. Destructive operations show how many "
+            "files / bytes were removed.\n\n"
+            "Slash equivalents:\n"
+            "  `/clear_chat [run_id]` `/clear_screenshots`\n"
+            "  `/clear_logs` `/clear_reasoning` `/clear_runs`\n"
+            "  `/clear_apply` (apply persisted settings)",
+            reply_markup=markup,
+        )
+
+    async def _send_retention_settings(self, sess: ChatSession) -> None:
+        """Show the persisted retention settings with one row per knob.
+
+        Each row exposes the operator-visible presets (e.g.
+        10/50/100/Unlimited screenshots). Tapping a button hits
+        ``POST /telemetry/settings`` via the ``rset`` callback,
+        which then re-renders this menu so the operator immediately
+        sees the change reflected.
+        """
+        try:
+            resp = await self._api("GET", "/telemetry/settings")
+        except _ApiError as exc:
+            await self._send(sess.chat_id, f"settings load failed: {exc}")
+            return
+        settings = resp.get("settings", {}) or {}
+        presets = resp.get("presets", {}) or {}
+
+        def _row(key: str, label_fmt: str, unit: str = "") -> list[dict[str, str]]:
+            options = presets.get(key) or []
+            current = settings.get(key, 0)
+            buttons: list[dict[str, str]] = []
+            for opt in options:
+                text = (
+                    "Unlimited" if opt == 0 and "screenshot" in key
+                    else "Never" if opt == 0 and "auto_delete" in key
+                    else "Keep all" if opt == 0
+                    else label_fmt.format(opt)
+                ) + (f" {unit}" if unit and opt > 0 else "")
+                marker = "● " if opt == int(current) else ""
+                buttons.append({
+                    "text": (marker + text).strip(),
+                    "callback_data": f"rset:{key}:{opt}",
+                })
+            return buttons
+
+        keyboard = [
+            _row("screenshot_limit", "Last {}"),
+            _row("auto_delete_minutes", "{}", "min"),
+            _row("reasoning_limit", "Last {}"),
+            _row("keep_completed_runs", "Last {}"),
+            [{"text": "← Back to Cleanup", "callback_data": "menu_cleanup:_"}],
+        ]
+        markup = json.dumps({"inline_keyboard": keyboard})
+
+        text = (
+            "⚙ *Retention Settings*\n\n"
+            "Pick limits for each category. ``0`` / Unlimited / Never "
+            "disables auto-trim for that category.\n\n"
+            f"Screenshots/account:    {_fmt_limit(settings.get('screenshot_limit'), 'last')}\n"
+            f"Auto-delete events:     {_fmt_minutes(settings.get('auto_delete_minutes'))}\n"
+            f"Reasoning lines/acct:   {_fmt_limit(settings.get('reasoning_limit'), 'last')}\n"
+            f"Completed runs kept:    {_fmt_limit(settings.get('keep_completed_runs'), 'last')}\n"
+        )
+        await self._send(sess.chat_id, text, reply_markup=markup)
+
+    async def _send_storage_summary(self, sess: ChatSession) -> None:
+        """Show aggregate disk usage so operators can decide what to trim."""
+        try:
+            data = await self._api("GET", "/telemetry/usage")
+        except _ApiError as exc:
+            await self._send(sess.chat_id, f"usage failed: {exc}")
+            return
+        settings = data.get("settings", {}) or {}
+        text = (
+            "📦 *Storage Usage*\n\n"
+            f"Runs on disk:       {data.get('runs', 0)}\n"
+            f"Screenshots:        {data.get('screenshots', 0)}\n"
+            f"Reasoning lines:    {data.get('reasoning_lines', 0)}\n"
+            f"Total size:         {data.get('total_mb', 0)} MB\n\n"
+            "Current limits:\n"
+            f"  Screenshots/acct: {_fmt_limit(settings.get('screenshot_limit'), 'last')}\n"
+            f"  Reasoning/acct:   {_fmt_limit(settings.get('reasoning_limit'), 'last')}\n"
+            f"  Auto-delete:      {_fmt_minutes(settings.get('auto_delete_minutes'))}\n"
+            f"  Completed runs:   {_fmt_limit(settings.get('keep_completed_runs'), 'last')}\n"
+        )
+        markup = json.dumps({
+            "inline_keyboard": [[
+                {"text": "🧹 Open cleanup", "callback_data": "menu_cleanup:_"},
+                {"text": "⚙ Settings", "callback_data": "menu_settings_retention:_"},
+            ]],
+        })
+        await self._send(sess.chat_id, text, reply_markup=markup)
+
+    async def _handle_clear_callback(
+        self, sess: ChatSession, *, op: str, run_id: str | None,
+    ) -> None:
+        """Dispatch a ``clear:<op>[:run_id]`` button press."""
+        try:
+            text = await self._format_cleanup_command(
+                op=op, run_id=run_id, account_id=None,
+            )
+        except _ApiError as exc:
+            await self._send(sess.chat_id, f"clear {op} failed: {exc}")
+            return
+        await self._send(sess.chat_id, text)
+        # Re-render the cleanup menu so the operator can chain actions
+        # without typing /cleanup again.
+        await self._send_cleanup_menu(sess)
+
+    async def _handle_setting_callback(
+        self, sess: ChatSession, *, key: str, value: str,
+    ) -> None:
+        """Dispatch a ``rset:<key>:<value>`` button press."""
+        if not key:
+            await self._send(sess.chat_id, "missing setting key")
+            return
+        try:
+            int_value = int(value)
+        except (TypeError, ValueError):
+            await self._send(sess.chat_id, f"invalid value for {key}: {value!r}")
+            return
+        try:
+            await self._api(
+                "POST", "/telemetry/settings", body={key: int_value},
+            )
+        except _ApiError as exc:
+            await self._send(sess.chat_id, f"setting update failed: {exc}")
+            return
+        # Re-render the settings panel so the operator sees the new
+        # selected option highlighted.
+        await self._send_retention_settings(sess)
+
+    async def _format_cleanup_command(
+        self,
+        *,
+        op: str,
+        run_id: str | None,
+        account_id: str | None,
+    ) -> str:
+        """Run a single cleanup operation and return a formatted summary.
+
+        Maps the short op-name from the callback (or slash command)
+        onto the matching ``/telemetry/clear/*`` endpoint and
+        formats the structured response for chat display.
+        """
+        body: dict[str, Any] = {}
+        if run_id:
+            body["run_id"] = run_id
+        if account_id:
+            body["account_id"] = account_id
+
+        endpoint_map = {
+            "chat": "/telemetry/clear/chat",
+            "screenshots": "/telemetry/clear/screenshots",
+            "logs": "/telemetry/clear/logs",
+            "reasoning": "/telemetry/clear/reasoning",
+            "runs": "/telemetry/clear/runs",
+        }
+        # Special case: "runs_completed" sweeps every completed run.
+        if op == "runs_completed":
+            body.pop("run_id", None)
+            body["only_completed"] = True
+            body["keep_last"] = 0
+            endpoint = "/telemetry/clear/runs"
+            label = "completed runs"
+        elif op in endpoint_map:
+            endpoint = endpoint_map[op]
+            label = op
+        else:
+            return f"unknown clear op: {op}"
+
+        try:
+            resp = await self._api("POST", endpoint, body=body)
+        except _ApiError as exc:
+            return f"clear {label} failed: {exc}"
+        return _format_cleanup_result(resp, op=label)
+
+    async def _send_photo(
+        self, chat_id: int, photo_path: str, caption: str = "",
+    ) -> bool:
+        """Send a photo file to a chat via Telegram's sendPhoto API.
+
+        Returns True on success. Falls back to sending the path as text
+        if the file cannot be read or the upload fails.
+        """
+        import os
+        if not os.path.isfile(photo_path):
+            await self._send(chat_id, f"📷 {caption}\n(file not found: {photo_path})")
+            return False
+
+        try:
+            import io
+            import http.client
+            from urllib.parse import urlparse
+
+            # Read file
+            with open(photo_path, "rb") as f:
+                photo_data = f.read()
+
+            # Build multipart form data
+            boundary = secrets.token_hex(16)
+            body_parts = []
+
+            # chat_id field
+            body_parts.append(f"--{boundary}\r\n".encode())
+            body_parts.append(b'Content-Disposition: form-data; name="chat_id"\r\n\r\n')
+            body_parts.append(f"{chat_id}\r\n".encode())
+
+            # caption field
+            if caption:
+                body_parts.append(f"--{boundary}\r\n".encode())
+                body_parts.append(b'Content-Disposition: form-data; name="caption"\r\n\r\n')
+                body_parts.append(f"{caption}\r\n".encode())
+
+            # photo field
+            filename = os.path.basename(photo_path)
+            body_parts.append(f"--{boundary}\r\n".encode())
+            body_parts.append(
+                f'Content-Disposition: form-data; name="photo"; filename="{filename}"\r\n'
+                f"Content-Type: image/png\r\n\r\n".encode()
+            )
+            body_parts.append(photo_data)
+            body_parts.append(b"\r\n")
+            body_parts.append(f"--{boundary}--\r\n".encode())
+
+            payload = b"".join(body_parts)
+
+            url = f"{API}/bot{self.token}/sendPhoto"
+            parsed = urlparse(url)
+            conn = http.client.HTTPSConnection(parsed.hostname, timeout=30)
+            conn.request(
+                "POST", parsed.path,
+                body=payload,
+                headers={
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                    "Content-Length": str(len(payload)),
+                },
+            )
+            resp = conn.getresponse()
+            conn.close()
+            return resp.status == 200
+
+        except Exception as exc:  # noqa: BLE001
+            log.debug("sendPhoto failed for %s: %s", photo_path, exc)
+            await self._send(chat_id, f"📷 {caption}\n(upload failed: {photo_path})")
+            return False
+
+    async def _send_live_dashboard(
+        self, sess: ChatSession, run_id: str,
+    ) -> None:
+        """Send a compact live dashboard for the current run state.
+
+        Shows per-account progress with confidence, current goal, and
+        recovery attempts — designed to be readable without scrolling.
+        """
+        try:
+            resp = await self._api("GET", f"/agent/runs/{run_id}")
+        except _ApiError as exc:
+            await self._send(sess.chat_id, f"dashboard failed: {exc}")
+            return
+
+        run = resp.get("run") or resp
+        accounts = run.get("accounts") or []
+        goals = run.get("goals") or []
+        status = run.get("status") or "unknown"
+
+        lines = [f"📊 *Live Dashboard* — {run_id}", f"Status: {status}\n"]
+
+        for i, acc_id in enumerate(accounts[:10], 1):
+            # Try to get reasoning for this account
+            try:
+                r_data = await self._api(
+                    "GET",
+                    f"/agent/runs/{run_id}/reasoning/{acc_id}?n=1",
+                )
+                entries = r_data.get("entries") or []
+            except _ApiError:
+                entries = []
+
+            if entries:
+                latest = entries[0]
+                goal = latest.get("goal", "?")
+                confidence = latest.get("confidence", 0)
+                success = latest.get("success", True)
+                source = latest.get("source", "?")
+                marker = "✓" if success else "⚠"
+                lines.append(
+                    f"{marker} Account {i}/{len(accounts)}\n"
+                    f"  Goal: {goal}\n"
+                    f"  Confidence: {int(confidence * 100)}%\n"
+                    f"  Source: {source}"
+                )
+            else:
+                lines.append(f"⏳ Account {i}/{len(accounts)} — waiting")
+
+        if len(accounts) > 10:
+            lines.append(f"\n(+{len(accounts) - 10} more accounts)")
+
+        lines.append(f"\nGoals: {len(goals)}")
+        await self._send(sess.chat_id, "\n".join(lines))
+
+    async def _send_run_report(
+        self, sess: ChatSession, run_id: str,
+    ) -> None:
+        """Send a post-completion report with success rate, AI usage, etc."""
+        try:
+            resp = await self._api("GET", f"/agent/runs/{run_id}")
+        except _ApiError as exc:
+            await self._send(sess.chat_id, f"report failed: {exc}")
+            return
+
+        run = resp.get("run") or resp
+        accounts = run.get("accounts") or []
+        status = run.get("status") or "?"
+        goals = run.get("goals") or []
+        instruction = (run.get("instruction") or "")[:100]
+        error = run.get("error")
+
+        # Count successes from memory files or just report total
+        lines = [
+            "📋 *Run Report*\n",
+            f"Run ID:      {run_id}",
+            f"Status:      {status}",
+            f"Instruction: {instruction}",
+            f"Accounts:    {len(accounts)}",
+            f"Goals:       {len(goals)}",
+        ]
+        if error:
+            lines.append(f"Error:       {error[:200]}")
+
+        lines.append("\n*Summary*")
+        lines.append(f"Processed:   {len(accounts)}")
+        lines.append(f"Total Goals: {len(goals)}")
+
+        await self._send(sess.chat_id, "\n".join(lines))
+
+    async def _send_reasoning(
+        self,
+        sess: ChatSession,
+        *,
+        run_id: str,
+        account_id: str | None = None,
+    ) -> None:
+        """Render the most recent reasoning entries for one account.
+
+        When ``account_id`` is None the helper picks the first account
+        listed on the run summary, which is the most useful default for
+        a single-account run started from this very chat.
+        """
+        if not account_id:
+            try:
+                run = (await self._api("GET", f"/agent/runs/{run_id}")).get("run") or {}
+            except _ApiError as exc:
+                await self._send(sess.chat_id, f"reasoning failed: {exc}")
+                return
+            accs = run.get("accounts") or []
+            if not accs:
+                await self._send(sess.chat_id, "no accounts in run")
+                return
+            account_id = accs[0]
+        try:
+            data = await self._api(
+                "GET",
+                f"/agent/runs/{run_id}/reasoning/{account_id}?n=5",
+            )
+        except _ApiError as exc:
+            await self._send(sess.chat_id, f"reasoning failed: {exc}")
+            return
+        entries = data.get("entries") or []
+        if not entries:
+            await self._send(
+                sess.chat_id,
+                f"🧠 no reasoning entries yet for {account_id} in {run_id}",
+            )
+            return
+        # Render newest-first; cap at 4 blocks so we stay under the
+        # 4096-char Telegram limit even for verbose entries.
+        blocks = []
+        for e in entries[:4]:
+            blocks.append(_format_reasoning_block(e))
+        await self._send(
+            sess.chat_id,
+            f"🧠 reasoning for {account_id} (run {run_id})\n\n"
+            + "\n\n".join(blocks),
+        )
+
+    async def _send_screenshots(
+        self,
+        sess: ChatSession,
+        *,
+        run_id: str,
+        account_id: str | None = None,
+    ) -> None:
+        """Send recent screenshots as actual images to the chat.
+
+        Sends up to 5 most recent screenshots as photos via sendPhoto.
+        Falls back to file paths if upload fails.
+        """
+        if not account_id:
+            try:
+                run = (await self._api("GET", f"/agent/runs/{run_id}")).get("run") or {}
+            except _ApiError as exc:
+                await self._send(sess.chat_id, f"screenshots failed: {exc}")
+                return
+            accs = run.get("accounts") or []
+            if not accs:
+                await self._send(sess.chat_id, "no accounts in run")
+                return
+            account_id = accs[0]
+        try:
+            data = await self._api(
+                "GET",
+                f"/agent/runs/{run_id}/screenshots/{account_id}?limit=5",
+            )
+        except _ApiError as exc:
+            await self._send(sess.chat_id, f"screenshots failed: {exc}")
+            return
+        paths = data.get("paths") or []
+        if not paths:
+            await self._send(
+                sess.chat_id,
+                f"📷 no screenshots for {account_id} in {run_id}",
+            )
+            return
+
+        await self._send(
+            sess.chat_id,
+            f"📷 Sending {len(paths)} screenshot(s) for {account_id}…",
+        )
+
+        sent_count = 0
+        for i, path in enumerate(paths[:5]):
+            caption = f"Screenshot {i + 1}/{len(paths)} — {account_id}"
+            success = await self._send_photo(sess.chat_id, path, caption)
+            if success:
+                sent_count += 1
+
+        if sent_count == 0:
+            # Fallback: send as file paths if all uploads failed
+            msg = (
+                f"📷 Could not upload images. Paths:\n\n"
+                + "\n".join(paths[:5])
+            )
+            await self._send(sess.chat_id, msg)
+        elif sent_count < len(paths):
+            await self._send(
+                sess.chat_id,
+                f"({sent_count}/{len(paths)} screenshots sent successfully)",
+            )
+
+    async def _format_templates(self) -> str:
+        try:
+            data = await self._api("GET", "/ai/templates")
+        except _ApiError as exc:
+            return f"templates failed: {exc}"
+        if not data.get("enabled", True):
+            return "AI memory disabled — no templates"
+        templates = data.get("templates") or []
+        if not templates:
+            return "no learned templates yet"
+        stats = data.get("stats") or {}
+        lines = [
+            "learned templates (replay-first):",
+            f"  workflow runs: total={stats.get('total', 0)} "
+            f"ok={stats.get('ok', 0)} "
+            f"sr={(stats.get('success_rate') or 0):.2f}",
+            "",
+        ]
+        for t in templates[:20]:
+            lines.append(
+                f"- sig={t.get('page_signature', '?')[:24]} "
+                f"title={(t.get('title') or '?')[:40]} "
+                f"seen={t.get('seen_count', 0)} "
+                f"intents={t.get('intent_count', 0)}"
+            )
+            for intent, info in (t.get("intents") or {}).items():
+                lines.append(
+                    f"    {intent:<18} conf={info.get('confidence', 0):.2f} "
+                    f"hits={info.get('success_count', 0)}"
+                )
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------- HTTP I/O
+    async def _api(
+        self, method: str, path: str, body: dict[str, Any] | None = None,
+    ) -> dict:
         url = f"{self.api_base_url}{path}"
         headers = {"Accept": "application/json"}
         if self.api_token:
@@ -187,7 +1734,18 @@ class TelegramController:
         if data:
             headers["Content-Type"] = "application/json"
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, _http_call, method, url, headers, data)
+        try:
+            return await loop.run_in_executor(
+                None, _http_call, method, url, headers, data,
+            )
+        except urllib.request.HTTPError as e:
+            try:
+                detail = e.read().decode("utf-8")[:500]
+            except Exception:  # noqa: BLE001
+                detail = ""
+            raise _ApiError(f"{e.code} {e.reason} {detail}".strip()) from e
+        except Exception as exc:  # noqa: BLE001
+            raise _ApiError(str(exc)) from exc
 
     async def _call(self, method: str, params: dict[str, Any]) -> dict:
         url = f"{API}/bot{self.token}/{method}"
@@ -198,22 +1756,243 @@ class TelegramController:
             {"Content-Type": "application/x-www-form-urlencoded"}, body,
         )
 
-    async def _send(self, chat_id: int, text: str) -> None:
-        # Telegram has a 4096 char limit; chunk politely.
-        for chunk in [text[i:i + 3500] for i in range(0, len(text) or 1, 3500)]:
+    async def _send(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        reply_markup: str | None = None,
+    ) -> None:
+        if not text:
+            return
+        # Telegram caps at 4096 chars per message; chunk politely.
+        chunks = [
+            text[i: i + _MAX_TG_CHARS]
+            for i in range(0, len(text), _MAX_TG_CHARS)
+        ]
+        for i, chunk in enumerate(chunks):
+            params: dict[str, Any] = {"chat_id": chat_id, "text": chunk}
+            # Only attach the keyboard to the LAST chunk so it stays usable.
+            if reply_markup and i == len(chunks) - 1:
+                params["reply_markup"] = reply_markup
             try:
-                await self._call("sendMessage", {"chat_id": chat_id, "text": chunk})
+                await self._call("sendMessage", params)
             except Exception:  # noqa: BLE001
                 log.exception("telegram send failed")
 
+    async def _answer_callback(
+        self, cq_id: str | None, text: str = "", *, alert: bool = False,
+    ) -> None:
+        if not cq_id:
+            return
+        try:
+            await self._call(
+                "answerCallbackQuery",
+                {"callback_query_id": cq_id, "text": text, "show_alert": alert},
+            )
+        except Exception:  # noqa: BLE001
+            log.debug("answerCallbackQuery failed")
+
+
+# ---------------------------------------------------------------- helpers
+
+
+class _Reply(Exception):
+    """Raised by command handlers to short-circuit the default reply.
+
+    Used when the handler has already pushed messages to the chat (e.g. an
+    inline keyboard) and the dispatcher should NOT send a follow-up text.
+    """
+
+    def __init__(self, text: str = "", markup: str | None = None) -> None:
+        super().__init__(text)
+        self.text = text
+        self.markup = markup
+
+
+class _ApiError(RuntimeError):
+    """Wraps an HTTP error from the local FastAPI."""
+
+
+def _http_call(
+    method: str,
+    url: str,
+    headers: dict[str, str],
+    body: bytes | None,
+) -> dict:
+    req = urllib.request.Request(url, data=body, method=method, headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        text = resp.read().decode("utf-8")
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return {"raw": text}
+
+
+# ------------------------------------------------------------- formatters
 
 _HELP = (
-    "Commands:\n"
-    "/start /stop /restart /reload /status /health\n"
-    "/plugins /logs [activity|error|debug]\n"
-    "/accounts /completed [N] /failed [N] /rejected /reload_accounts\n"
-    "/workers /queue /workflows /ai"
+    "EXECUTION\n"
+    "  /run [text]            plan + confirm + execute\n"
+    "  /plan [text]           preview a plan only\n"
+    "  /newtask               prompt for an instruction\n"
+    "  /batch [text]          multi-account NL with batching\n"
+    "  /watch [run_id]        stream live progress\n"
+    "  /unwatch [run_id]      stop streaming\n"
+    "  /cancel [run_id]       cancel a running execution\n"
+    "  /pause [run_id]        ⏸ pause an active run between goals\n"
+    "  /resume_paused [r_id]  ▶ lift a /pause (in-flight)\n"
+    "  /resume <run_id>       resume from checkpoint (post-crash)\n"
+    "  /reasoning <r> [acc]   🧠 show last reasoning entries\n"
+    "  /screenshots <r> [acc] 📷 list recent screenshots\n"
+    "  /replay <run_id> [acc] show replay summary\n"
+    "  /templates             list learned templates\n"
+    "  /runs [N]              recent runs\n"
+    "  /runinfo <run_id>      details for one run\n"
+    "  /wf <name> [acc]       run a workflow file\n"
+    "  /wfbatch <name> <ids>  workflow batch run\n"
+    "  /abort                 discard a pending plan\n"
+    "\n"
+    "CLEANUP\n"
+    "  /cleanup               🧹 open the cleanup menu\n"
+    "  /storage               📦 disk usage summary\n"
+    "  /clear_chat [r] [a]    🗑 logs + reasoning + screenshots\n"
+    "  /clear_screenshots [r] [a]  🗑 trim screenshot files\n"
+    "  /clear_logs [r] [a]    🗑 delete log files\n"
+    "  /clear_reasoning [r] [a]    🗑 trim reasoning.jsonl\n"
+    "  /clear_runs [r]        🗑 remove run directories\n"
+    "  /clear_apply           apply persisted retention settings\n"
+    "  /retention             ⚙ retention settings menu\n"
+    "\n"
+    "ENGINE LIFECYCLE\n"
+    "  /engine_start          start the framework engine\n"
+    "  /stop                  stop the framework engine\n"
+    "  /restart               restart the framework engine\n"
+    "  /reload                hot-reload config + plugins\n"
+    "\n"
+    "MONITORING\n"
+    "  /status /health /plugins /logs /workers /queue /workflows /ai\n"
+    "  /accounts /completed [N] /failed [N] /rejected /reload_accounts\n"
+    "\n"
+    "TIP\n"
+    "  Plain text without a leading slash is treated as a natural-language\n"
+    "  instruction and goes through the same plan-and-confirm flow."
 )
+
+
+def _format_plan_preview(
+    preview: dict[str, Any],
+    parallel: bool,
+    max_parallel: int | None,
+    *,
+    footer: str = "Tap Confirm to execute, or Cancel to discard.",
+) -> str:
+    instruction = (preview.get("instruction") or "").strip()
+    goals = preview.get("goals") or []
+    target = preview.get("target_url") or "(none)"
+    accounts = preview.get("account_count", 0)
+    eta = preview.get("estimated_time_seconds", 0) or 0
+    notes = preview.get("notes") or []
+
+    lines = ["execution plan:"]
+    if instruction:
+        lines.append(f"  goal:        {instruction[:200]}")
+    lines.extend([
+        f"  target url:  {target}",
+        f"  accounts:    {accounts}",
+        f"  parallel:    {parallel}"
+        + (f" (max {max_parallel})" if parallel and max_parallel else ""),
+        f"  estimate:    {int(eta)}s",
+        f"  AI calls:    ~{len(goals) * accounts} (max, less with templates)",
+        "  steps:",
+    ])
+    for i, g in enumerate(goals, 1):
+        desc = g.get("description") or g.get("type") or f"step {i}"
+        lines.append(f"    {i}. {desc}")
+    if notes:
+        lines.append("  notes:")
+        for n in notes:
+            lines.append(f"    - {n}")
+    if footer:
+        lines.append("")
+        lines.append(footer)
+    return "\n".join(lines)
+
+
+def _format_event_batch(run_id: str, events: list[dict[str, Any]]) -> str:
+    """Compact, human-readable rollup of a batch of agent events.
+
+    Skips noisy intermediate events (WAITING / WAIT_RESOLVED) unless the
+    batch contains nothing else, so chat messages stay scannable.
+    """
+    high_value = {
+        "agent.run.started", "agent.run.completed", "agent.run.failed",
+        "agent.run.cancelled", "agent.run.resumed",
+        "agent.account.started", "agent.account.completed",
+        "agent.account.failed",
+        "agent.goal.started", "agent.goal.completed", "agent.goal.failed",
+        "agent.recovery.started", "agent.recovery.succeeded",
+        "agent.recovery.failed",
+        "agent.verification.passed", "agent.verification.failed",
+        "agent.ai.decision",
+    }
+    keep = [e for e in events if e.get("type") in high_value]
+    if not keep:
+        # Fall back to the raw events so the user always sees *something*.
+        keep = events[-3:]
+
+    out = [f"[{run_id}]"]
+    for e in keep[-12:]:  # cap a single message at ~12 events
+        out.append("  " + _format_event_line(e))
+    return "\n".join(out)
+
+
+def _format_event_line(e: dict[str, Any]) -> str:
+    etype = (e.get("type") or "").replace("agent.", "")
+    acc = e.get("account_id") or ""
+    goal = e.get("goal") or ""
+    msg = (e.get("message") or "").replace("\n", " ")
+    conf = e.get("confidence") or 0.0
+    parts = [etype]
+    if acc:
+        parts.append(f"acc={acc}")
+    if goal:
+        parts.append(f"goal={goal}")
+    if conf:
+        parts.append(f"conf={conf:.2f}")
+    if msg and msg.lower() != etype.lower():
+        parts.append(f"- {msg[:120]}")
+    return " ".join(parts)
+
+
+def _format_replay_records(
+    run_id: str, account_id: str, replay: list[dict[str, Any]],
+) -> str:
+    lines = [
+        f"replay {run_id} / {account_id}",
+        f"  records: {len(replay)}",
+    ]
+    # Surface goal start/end and errors only — full replay can be massive.
+    for r in replay[:200]:
+        rtype = r.get("type", "?")
+        if rtype not in {"goal_start", "goal_end", "error", "navigate", "ai_decision"}:
+            continue
+        url = (r.get("url") or "")[:80]
+        goal = r.get("goal") or ""
+        ok = r.get("success", True)
+        dur = r.get("duration_ms", 0) or 0
+        marker = "+" if ok else "x"
+        bits = [f"  {marker} {rtype}"]
+        if goal:
+            bits.append(f"goal={goal}")
+        if url:
+            bits.append(f"url={url}")
+        if dur:
+            bits.append(f"dur={dur}ms")
+        if rtype == "error":
+            bits.append("err=" + str((r.get("data") or {}).get("error", ""))[:120])
+        lines.append(" ".join(bits))
+    return "\n".join(lines)
 
 
 def _format_accounts_status(data: Any) -> str:
@@ -257,15 +2036,157 @@ def _summary(data: Any, keys: tuple[str, ...] | None = None) -> str:
     if isinstance(data, dict):
         if keys:
             return "\n".join(f"{k}: {data.get(k)}" for k in keys)
-        return json.dumps(data, indent=2, default=str)[:3500]
+        return json.dumps(data, indent=2, default=str)[:_MAX_TG_CHARS]
     return str(data)
 
 
-def _http_call(method: str, url: str, headers: dict[str, str], body: bytes | None) -> dict:
-    req = urllib.request.Request(url, data=body, method=method, headers=headers)
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        text = resp.read().decode("utf-8")
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            return {"raw": text}
+
+def _format_run_status(resp: dict[str, Any]) -> str:
+    """Format the response of ``GET /agent/runs/{id}`` for a chat reply.
+
+    Picks just the fields a human cares about (status, accounts,
+    started/finished timestamps, error if any) so the chat doesn't
+    drown in JSON.
+    """
+    run = resp.get("run") or resp
+    status = run.get("status") or "unknown"
+    accounts = run.get("accounts") or []
+    goals_total = len(run.get("goals") or [])
+    started = run.get("started_at")
+    completed = run.get("completed_at")
+    err = run.get("error")
+    lines = [
+        f"📊 Run: {run.get('run_id', '?')}",
+        f"   status:    {status}",
+        f"   accounts:  {len(accounts)}  ({', '.join(accounts[:3])}"
+        + (f", +{len(accounts) - 3} more" if len(accounts) > 3 else "")
+        + ")",
+        f"   goals:     {goals_total}",
+    ]
+    if started:
+        lines.append(f"   started:   {started}")
+    if completed:
+        lines.append(f"   completed: {completed}")
+    if err:
+        lines.append(f"   error:     {err}")
+    if resp.get("active"):
+        lines.append("   (live)")
+    return "\n".join(lines)
+
+
+def _format_reasoning_block(entry: dict[str, Any]) -> str:
+    """Format one ReasoningEntry dict as a five-line panel.
+
+    Mirrors :py:meth:`automation.agent.reasoning.ReasoningEntry.render`
+    so chat output stays consistent with the on-disk log even when
+    the entry comes from the API rather than directly from the class.
+    """
+    goal_index = entry.get("goal_index", 0)
+    goal = entry.get("goal", "")
+    obs = entry.get("observation", "")
+    reasoning = entry.get("reasoning", "")
+    action = entry.get("action", "")
+    verification = entry.get("verification", "")
+    source = entry.get("source", "?")
+    confidence = entry.get("confidence", 0.0)
+    success = entry.get("success", True)
+    error = entry.get("error")
+    pieces = [
+        f"Goal #{goal_index}: {goal}",
+        f"Observation: {_short(obs)}",
+        f"Reasoning:   {_short(reasoning)} [{source} conf={confidence:.2f}]",
+        f"Action:      {_short(action)}",
+        f"Verification: {_short(verification)} ({'pass' if success else 'fail'})",
+    ]
+    if error:
+        pieces.append(f"Error: {_short(error)}")
+    return "\n".join(pieces)
+
+
+def _short(text: str, n: int = 220) -> str:
+    """Truncate a single line so the panel renders in Telegram."""
+    if not text:
+        return ""
+    text = str(text).replace("\n", " ").strip()
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+
+# ---------------------------------------------------- cleanup formatters
+
+def _format_cleanup_result(resp: dict[str, Any], *, op: str) -> str:
+    """Render a CleanupResult-shaped dict into a one-block chat message.
+
+    Keeps the layout consistent across every /clear_* command so
+    operators always see the same fields in the same order — files
+    removed, bytes removed, scope (runs/accounts touched), and any
+    notes. ``op`` is a free-form label ("screenshots", "logs", …)
+    that goes into the header so the operator immediately sees what
+    just happened.
+    """
+    files = int(resp.get("files_removed") or 0)
+    bytes_ = int(resp.get("bytes_removed") or 0)
+    runs = int(resp.get("runs_touched") or 0)
+    accounts = int(resp.get("accounts_touched") or 0)
+    duration_ms = int(resp.get("duration_ms") or 0)
+    ok = bool(resp.get("ok", True))
+    notes = resp.get("notes") or []
+
+    if not files and not bytes_ and not runs and not accounts:
+        # Nothing to do — say so explicitly rather than printing zeroes.
+        body = "nothing to remove"
+    else:
+        body = (
+            f"  files:    {files}\n"
+            f"  bytes:    {_fmt_bytes(bytes_)}\n"
+            f"  runs:     {runs}\n"
+            f"  accounts: {accounts}\n"
+            f"  duration: {duration_ms} ms"
+        )
+    header = "🗑 cleared {label}".format(label=op) if ok else f"⚠ partial clear ({op})"
+    lines = [header, body]
+    if notes:
+        lines.append("notes:")
+        for n in notes[:5]:
+            lines.append(f"  - {str(n)[:200]}")
+        if len(notes) > 5:
+            lines.append(f"  …(+{len(notes) - 5} more)")
+    return "\n".join(lines)
+
+
+def _fmt_bytes(num: int) -> str:
+    """Compact byte count: 0/512 B/3.4 KB/12.7 MB."""
+    n = float(num)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            if unit == "B":
+                return f"{int(n)} {unit}"
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+def _fmt_limit(value: Any, prefix: str) -> str:
+    """Pretty-print a retention limit."""
+    try:
+        n = int(value or 0)
+    except (TypeError, ValueError):
+        n = 0
+    if n <= 0:
+        return "Unlimited"
+    return f"{prefix} {n}"
+
+
+def _fmt_minutes(value: Any) -> str:
+    """Pretty-print the auto-delete-minutes setting."""
+    try:
+        n = int(value or 0)
+    except (TypeError, ValueError):
+        n = 0
+    if n <= 0:
+        return "Never"
+    if n < 60:
+        return f"{n} min"
+    if n % 60 == 0:
+        return f"{n // 60} hr"
+    return f"{n // 60} hr {n % 60} min"
